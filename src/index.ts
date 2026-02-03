@@ -6,7 +6,7 @@
 import { buildMapping } from "./scan";
 import type { Socket } from "bun";
 
-const PORT = parseInt(process.env.PORT || "9999", 10);
+const PORT = parseInt(process.env.PORT || "9090", 10);
 const CACHE_TTL_MS = 5000;
 
 let mappingCache: Map<string, number> = new Map();
