@@ -1,5 +1,5 @@
 /**
- * localhost-world daemon
+ * localworld daemon
  * Routes *.localhost:9999 to local services based on LOCALHOST_NAME env var
  */
 
@@ -76,7 +76,7 @@ async function renderDashboard(): Promise<Response> {
   let html = `<!DOCTYPE html>
 <html>
 <head>
-  <title>localhost-world</title>
+  <title>localworld</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
     h1 { color: #333; }
@@ -88,7 +88,7 @@ async function renderDashboard(): Promise<Response> {
   </style>
 </head>
 <body>
-  <h1>localhost-world</h1>
+  <h1>localworld</h1>
   <p>Routing <code>*.localhost:${PORT}</code> to local services</p>
 `;
 
@@ -146,7 +146,7 @@ async function handleRequest(req: Request): Promise<Response> {
 }
 
 // Start server
-console.log(`localhost-world listening on http://localhost:${PORT}`);
+console.log(`localworld listening on http://localhost:${PORT}`);
 console.log(`Dashboard: http://localhost:${PORT}`);
 console.log(`\nStart services with: NAME=myapp bun run server.ts`);
 

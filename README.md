@@ -1,4 +1,4 @@
-# localhost-world
+# localworld
 
 A macOS daemon that routes `*.localhost:9999` to local services based on environment variables.
 
@@ -36,7 +36,7 @@ The daemon auto-discovers running servers and routes requests to the correct por
 
 ```bash
 # Clone and enter directory
-cd ~/projects/localhost-world
+cd ~/projects/localworld
 
 # Allow direnv (loads nix flake with bun + just)
 direnv allow

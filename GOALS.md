@@ -1,4 +1,4 @@
-# localhost-world
+# localworld
 
 A macOS daemon that routes `*.localhost:9999` to local services based on environment variables.
 
@@ -25,7 +25,7 @@ No matter what port the service actually binds to.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    localhost-world                       │
+│                    localworld                       │
 │                   (daemon on :9999)                      │
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
@@ -100,7 +100,7 @@ Options:
 
 ```bash
 # Terminal 1: Start the daemon
-localhost-world
+localworld
 
 # Terminal 2: Start a service
 NAME=myapp node -e "require('http').createServer((req,res) => res.end('hello')).listen(4567)"

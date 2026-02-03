@@ -1,4 +1,4 @@
-# localhost-world
+# localworld
 
 A local router for all your development web servers. Route `*.localhost` subdomains to the right port automatically.
 
@@ -13,7 +13,7 @@ When working on multiple projects simultaneously:
 
 ## Solution
 
-localhost-world acts as a reverse proxy that:
+localworld acts as a reverse proxy that:
 1. Listens on a configurable port (e.g., 3080)
 2. Routes `*.localhost` subdomain requests to the appropriate local port
 3. Auto-discovers running servers and their ports
@@ -39,7 +39,7 @@ http://db.localhost
 
 ```
                       ┌─────────────────────────────┐
-                      │      localhost-world        │
+                      │      localworld        │
                       │      (reverse proxy)        │
  *.localhost:3080 ───►│                             │
                       │  subdomain → port mapping   │
@@ -64,13 +64,13 @@ http://db.localhost
 - Read environment variables from the process (e.g., `DOMAIN=foo`)
 
 ### 3. Mapping Strategies (in priority order)
-1. **Explicit config**: User-defined mappings in `~/.localhost-world/config.yaml`
+1. **Explicit config**: User-defined mappings in `~/.localworld/config.yaml`
 2. **Environment variable**: Process has `NAME=myapp` or `DOMAIN=myapp`
 3. **Project detection**: Infer from package.json name, directory name, etc.
 4. **Port-based fallback**: `p3000.localhost` → port 3000
 
 ### 4. Dashboard
-- Web UI at `localhost-world.localhost` or `_.localhost`
+- Web UI at `localworld.localhost` or `_.localhost`
 - Shows all discovered servers
 - Displays subdomain mappings
 - Quick links to each service
@@ -194,7 +194,7 @@ From `ps -Eww` we can extract:
   - Node: Native addon for libproc, or shell out to `ps`/`lsof`
   - Go: Native syscalls, easier cross-platform
 
-- **Config**: YAML or TOML file in `~/.localhost-world/`
+- **Config**: YAML or TOML file in `~/.localworld/`
 
 - **Dashboard**: Simple embedded web UI (vanilla or Preact)
 
@@ -224,7 +224,7 @@ From `ps -Eww` we can extract:
 ## Config File Example
 
 ```yaml
-# ~/.localhost-world/config.yaml
+# ~/.localworld/config.yaml
 
 # Explicit mappings (highest priority)
 mappings:
