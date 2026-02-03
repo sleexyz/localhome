@@ -11,6 +11,9 @@ const CACHE_TTL_MS = 5000; // Re-scan after 5 seconds
 let mappingCache: Map<string, number> = new Map();
 let lastScan = 0;
 
+// Track backend WebSocket connections for each client
+const wsBackends = new WeakMap<object, WebSocket>();
+
 /**
  * Get current mapping, re-scanning if cache is stale
  */
@@ -51,9 +54,14 @@ async function proxyRequest(req: Request, targetPort: number): Promise<Response>
   url.port = String(targetPort);
 
   try {
+    // Clone headers and strip conditional request headers to avoid 304 loops
+    const headers = new Headers(req.headers);
+    headers.delete("If-None-Match");
+    headers.delete("If-Modified-Since");
+
     const proxyReq = new Request(url.toString(), {
       method: req.method,
-      headers: req.headers,
+      headers,
       body: req.body,
       redirect: "manual",
     });
@@ -71,7 +79,6 @@ async function proxyRequest(req: Request, targetPort: number): Promise<Response>
  */
 async function renderDashboard(): Promise<Response> {
   const servers = await scanServers();
-  const mapping = await getMapping();
 
   let html = `<!DOCTYPE html>
 <html>
@@ -116,33 +123,16 @@ async function renderDashboard(): Promise<Response> {
 </html>`;
 
   return new Response(html, {
-    headers: { "Content-Type": "text/html" },
+    headers: { "Content-Type": "text/html; charset=utf-8" },
   });
 }
 
 /**
- * Main request handler
+ * Check if request is a WebSocket upgrade
  */
-async function handleRequest(req: Request): Promise<Response> {
-  const host = req.headers.get("host");
-  const subdomain = extractSubdomain(host);
-
-  // Dashboard at localhost:9999 or _.localhost:9999
-  if (!subdomain || subdomain === "_") {
-    return renderDashboard();
-  }
-
-  // Look up mapping
-  const mapping = await getMapping();
-  const targetPort = mapping.get(subdomain);
-
-  if (!targetPort) {
-    return new Response(`No server found for "${subdomain}.localhost"\n`, {
-      status: 404,
-    });
-  }
-
-  return proxyRequest(req, targetPort);
+function isWebSocketUpgrade(req: Request): boolean {
+  const upgrade = req.headers.get("upgrade");
+  return upgrade?.toLowerCase() === "websocket";
 }
 
 // Start server
@@ -150,7 +140,106 @@ console.log(`localhostess listening on http://localhost:${PORT}`);
 console.log(`Dashboard: http://localhost:${PORT}`);
 console.log(`\nStart services with: NAME=myapp bun run server.ts`);
 
-Bun.serve({
+const server = Bun.serve({
   port: PORT,
-  fetch: handleRequest,
+
+  async fetch(req, server) {
+    const host = req.headers.get("host");
+    const subdomain = extractSubdomain(host);
+
+    // Dashboard at localhost:9999 or _.localhost:9999
+    if (!subdomain || subdomain === "_") {
+      return renderDashboard();
+    }
+
+    // Look up mapping
+    const mapping = await getMapping();
+    const targetPort = mapping.get(subdomain);
+
+    if (!targetPort) {
+      return new Response(`No server found for "${subdomain}.localhost"\n`, {
+        status: 404,
+      });
+    }
+
+    // Handle WebSocket upgrade
+    if (isWebSocketUpgrade(req)) {
+      const url = new URL(req.url);
+      const backendUrl = `ws://localhost:${targetPort}${url.pathname}${url.search}`;
+      console.log(`[ws] Upgrading ${subdomain} -> ${backendUrl}`);
+
+      const upgraded = server.upgrade(req, {
+        data: { backendUrl, subdomain },
+      });
+
+      if (!upgraded) {
+        return new Response("WebSocket upgrade failed", { status: 400 });
+      }
+      return undefined as unknown as Response;
+    }
+
+    return proxyRequest(req, targetPort);
+  },
+
+  websocket: {
+    open(clientWs) {
+      const { backendUrl, subdomain } = clientWs.data as { backendUrl: string; subdomain: string };
+      console.log(`[ws] Client connected for ${subdomain}`);
+
+      // Connect to backend WebSocket
+      const backendWs = new WebSocket(backendUrl);
+
+      wsBackends.set(clientWs, backendWs);
+
+      backendWs.addEventListener("open", () => {
+        console.log(`[ws] Backend connected for ${subdomain}`);
+      });
+
+      backendWs.addEventListener("message", (event) => {
+        // Forward backend -> client
+        try {
+          if (typeof event.data === "string") {
+            clientWs.send(event.data);
+          } else if (event.data instanceof ArrayBuffer) {
+            clientWs.send(new Uint8Array(event.data));
+          } else if (event.data instanceof Blob) {
+            event.data.arrayBuffer().then((buf) => {
+              clientWs.send(new Uint8Array(buf));
+            });
+          }
+        } catch (e) {
+          console.log(`[ws] Error forwarding to client: ${e}`);
+        }
+      });
+
+      backendWs.addEventListener("close", (event) => {
+        console.log(`[ws] Backend closed for ${subdomain}: ${event.code}`);
+        clientWs.close(event.code, event.reason);
+      });
+
+      backendWs.addEventListener("error", (event) => {
+        console.log(`[ws] Backend error for ${subdomain}: ${event}`);
+        clientWs.close(1011, "Backend error");
+      });
+    },
+
+    message(clientWs, message) {
+      const backendWs = wsBackends.get(clientWs);
+      if (backendWs && backendWs.readyState === WebSocket.OPEN) {
+        // Forward client -> backend
+        backendWs.send(message);
+      }
+    },
+
+    close(clientWs, code, reason) {
+      const { subdomain } = clientWs.data as { subdomain: string };
+      console.log(`[ws] Client closed for ${subdomain}: ${code}`);
+
+      const backendWs = wsBackends.get(clientWs);
+      if (backendWs) {
+        backendWs.close(code, reason);
+        wsBackends.delete(clientWs);
+      }
+    },
+  },
 });
