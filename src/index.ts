@@ -1,22 +1,17 @@
 /**
- * localhostess daemon
- * Routes *.localhost:9999 to local services based on LOCALHOST_NAME env var
+ * TCP-level proxy for localhostess
+ * Handles WebSocket upgrades at the TCP level to avoid ECONNRESET issues
  */
 
-import { buildMapping, scanServers } from "./scan";
+import { buildMapping } from "./scan";
+import type { Socket } from "bun";
 
 const PORT = parseInt(process.env.PORT || "9999", 10);
-const CACHE_TTL_MS = 5000; // Re-scan after 5 seconds
+const CACHE_TTL_MS = 5000;
 
 let mappingCache: Map<string, number> = new Map();
 let lastScan = 0;
 
-// Track backend WebSocket connections for each client
-const wsBackends = new WeakMap<object, WebSocket>();
-
-/**
- * Get current mapping, re-scanning if cache is stale
- */
 async function getMapping(): Promise<Map<string, number>> {
   const now = Date.now();
   if (now - lastScan > CACHE_TTL_MS) {
@@ -26,61 +21,81 @@ async function getMapping(): Promise<Map<string, number>> {
   return mappingCache;
 }
 
-/**
- * Extract subdomain from Host header
- * e.g., "paper.localhost:9999" -> "paper"
- */
 function extractSubdomain(host: string | null): string | null {
   if (!host) return null;
-
-  // Remove port
   const hostname = host.split(":")[0];
-
-  // Check if it's a subdomain of localhost
   if (hostname === "localhost") return null;
   if (!hostname.endsWith(".localhost")) return null;
-
-  // Extract subdomain (everything before .localhost)
-  const subdomain = hostname.slice(0, -".localhost".length);
-  return subdomain || null;
+  return hostname.slice(0, -".localhost".length) || null;
 }
 
-/**
- * Proxy request to target port
- */
-async function proxyRequest(req: Request, targetPort: number): Promise<Response> {
-  const url = new URL(req.url);
-  url.hostname = "localhost";
-  url.port = String(targetPort);
+type SocketData = {
+  buffer: Buffer;
+  headersParsed: boolean;
+  isUpgrade: boolean;
+  backend: Socket<BackendData> | null;
+  host: string | null;
+  subdomain: string | null;
+  targetPort: number | null;
+};
 
-  try {
-    // Clone headers and strip conditional request headers to avoid 304 loops
-    const headers = new Headers(req.headers);
-    headers.delete("If-None-Match");
-    headers.delete("If-Modified-Since");
+type BackendData = {
+  client: Socket<SocketData>;
+};
 
-    const proxyReq = new Request(url.toString(), {
-      method: req.method,
-      headers,
-      body: req.body,
-      redirect: "manual",
-    });
-
-    return await fetch(proxyReq);
-  } catch (e) {
-    return new Response(`Failed to proxy to port ${targetPort}: ${e}`, {
-      status: 502,
-    });
+function parseHttpHeaders(data: Buffer): {
+  complete: boolean;
+  method?: string;
+  path?: string;
+  headers?: Map<string, string>;
+  headerEndIndex?: number;
+} {
+  const str = data.toString("utf8");
+  const headerEnd = str.indexOf("\r\n\r\n");
+  if (headerEnd === -1) {
+    return { complete: false };
   }
+
+  const headerSection = str.slice(0, headerEnd);
+  const lines = headerSection.split("\r\n");
+  const [method, path] = lines[0].split(" ");
+
+  const headers = new Map<string, string>();
+  for (let i = 1; i < lines.length; i++) {
+    const colonIdx = lines[i].indexOf(":");
+    if (colonIdx > 0) {
+      const key = lines[i].slice(0, colonIdx).toLowerCase().trim();
+      const value = lines[i].slice(colonIdx + 1).trim();
+      headers.set(key, value);
+    }
+  }
+
+  return {
+    complete: true,
+    method,
+    path,
+    headers,
+    headerEndIndex: headerEnd + 4
+  };
 }
 
-/**
- * Render dashboard HTML
- */
-async function renderDashboard(): Promise<Response> {
+function isWebSocketUpgrade(headers: Map<string, string>): boolean {
+  const upgrade = headers.get("upgrade");
+  const connection = headers.get("connection");
+  return upgrade?.toLowerCase() === "websocket" &&
+         (connection?.toLowerCase().includes("upgrade") ?? false);
+}
+
+// Dashboard HTML generator
+async function renderDashboard(): Promise<string> {
+  const { scanServers } = await import("./scan");
   const servers = await scanServers();
 
-  let html = `<!DOCTYPE html>
+  let html = `HTTP/1.1 200 OK\r
+Content-Type: text/html; charset=utf-8\r
+Connection: close\r
+\r
+<!DOCTYPE html>
 <html>
 <head>
   <title>localhostess</title>
@@ -95,7 +110,7 @@ async function renderDashboard(): Promise<Response> {
   </style>
 </head>
 <body>
-  <h1>localhostess</h1>
+  <h1>localhostess (tcp mode)</h1>
   <p>Routing <code>*.localhost:${PORT}</code> to local services</p>
 `;
 
@@ -122,123 +137,207 @@ async function renderDashboard(): Promise<Response> {
 </body>
 </html>`;
 
-  return new Response(html, {
-    headers: { "Content-Type": "text/html; charset=utf-8" },
-  });
+  return html;
 }
 
-/**
- * Check if request is a WebSocket upgrade
- */
-function isWebSocketUpgrade(req: Request): boolean {
-  const upgrade = req.headers.get("upgrade");
-  return upgrade?.toLowerCase() === "websocket";
-}
-
-// Start server
-console.log(`localhostess listening on http://localhost:${PORT}`);
+console.log(`localhostess (tcp mode) listening on http://localhost:${PORT}`);
 console.log(`Dashboard: http://localhost:${PORT}`);
 console.log(`\nStart services with: NAME=myapp bun run server.ts`);
 
-const server = Bun.serve({
+Bun.listen<SocketData>({
+  hostname: "0.0.0.0",
   port: PORT,
 
-  async fetch(req, server) {
-    const host = req.headers.get("host");
-    const subdomain = extractSubdomain(host);
+  socket: {
+    open(socket) {
+      socket.data = {
+        buffer: Buffer.alloc(0),
+        headersParsed: false,
+        isUpgrade: false,
+        backend: null,
+        host: null,
+        subdomain: null,
+        targetPort: null,
+      };
+    },
 
-    // Dashboard at localhost:9999 or _.localhost:9999
-    if (!subdomain || subdomain === "_") {
-      return renderDashboard();
-    }
+    async data(socket, data) {
+      const socketData = socket.data;
 
-    // Look up mapping
-    const mapping = await getMapping();
-    const targetPort = mapping.get(subdomain);
-
-    if (!targetPort) {
-      return new Response(`No server found for "${subdomain}.localhost"\n`, {
-        status: 404,
-      });
-    }
-
-    // Handle WebSocket upgrade
-    if (isWebSocketUpgrade(req)) {
-      const url = new URL(req.url);
-      const backendUrl = `ws://localhost:${targetPort}${url.pathname}${url.search}`;
-      console.log(`[ws] Upgrading ${subdomain} -> ${backendUrl}`);
-
-      const upgraded = server.upgrade(req, {
-        data: { backendUrl, subdomain },
-      });
-
-      if (!upgraded) {
-        return new Response("WebSocket upgrade failed", { status: 400 });
+      // If we already have a backend connection, just forward data
+      if (socketData.backend) {
+        socketData.backend.write(data);
+        return;
       }
-      return undefined as unknown as Response;
-    }
 
-    return proxyRequest(req, targetPort);
-  },
+      // Accumulate data until we have complete headers
+      socketData.buffer = Buffer.concat([socketData.buffer, data]);
 
-  websocket: {
-    open(clientWs) {
-      const { backendUrl, subdomain } = clientWs.data as { backendUrl: string; subdomain: string };
-      console.log(`[ws] Client connected for ${subdomain}`);
-
-      // Connect to backend WebSocket
-      const backendWs = new WebSocket(backendUrl);
-
-      wsBackends.set(clientWs, backendWs);
-
-      backendWs.addEventListener("open", () => {
-        console.log(`[ws] Backend connected for ${subdomain}`);
-      });
-
-      backendWs.addEventListener("message", (event) => {
-        // Forward backend -> client
-        try {
-          if (typeof event.data === "string") {
-            clientWs.send(event.data);
-          } else if (event.data instanceof ArrayBuffer) {
-            clientWs.send(new Uint8Array(event.data));
-          } else if (event.data instanceof Blob) {
-            event.data.arrayBuffer().then((buf) => {
-              clientWs.send(new Uint8Array(buf));
-            });
-          }
-        } catch (e) {
-          console.log(`[ws] Error forwarding to client: ${e}`);
+      if (!socketData.headersParsed) {
+        const parsed = parseHttpHeaders(socketData.buffer);
+        if (!parsed.complete) {
+          return; // Wait for more data
         }
-      });
 
-      backendWs.addEventListener("close", (event) => {
-        console.log(`[ws] Backend closed for ${subdomain}: ${event.code}`);
-        clientWs.close(event.code, event.reason);
-      });
+        socketData.headersParsed = true;
+        const { method, path, headers, headerEndIndex } = parsed;
 
-      backendWs.addEventListener("error", (event) => {
-        console.log(`[ws] Backend error for ${subdomain}: ${event}`);
-        clientWs.close(1011, "Backend error");
-      });
-    },
+        socketData.host = headers!.get("host") || null;
+        socketData.subdomain = extractSubdomain(socketData.host);
+        socketData.isUpgrade = isWebSocketUpgrade(headers!);
 
-    message(clientWs, message) {
-      const backendWs = wsBackends.get(clientWs);
-      if (backendWs && backendWs.readyState === WebSocket.OPEN) {
-        // Forward client -> backend
-        backendWs.send(message);
+        // Dashboard request
+        if (!socketData.subdomain || socketData.subdomain === "_") {
+          const dashboard = await renderDashboard();
+          socket.write(dashboard);
+          socket.end();
+          return;
+        }
+
+        // Look up target port
+        const mapping = await getMapping();
+        socketData.targetPort = mapping.get(socketData.subdomain) || null;
+
+        if (!socketData.targetPort) {
+          socket.write(`HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNo server found for "${socketData.subdomain}.localhost"\n`);
+          socket.end();
+          return;
+        }
+
+        if (socketData.isUpgrade) {
+          // WebSocket upgrade - do TCP-level proxying
+          console.log(`[tcp] WebSocket upgrade ${socketData.subdomain} -> :${socketData.targetPort}`);
+
+          try {
+            const backend = await Bun.connect<BackendData>({
+              hostname: "localhost",
+              port: socketData.targetPort,
+              socket: {
+                open(backendSocket) {
+                  backendSocket.data = { client: socket };
+                  // Forward the original request including headers
+                  backendSocket.write(socketData.buffer);
+                },
+                data(backendSocket, backendData) {
+                  // Forward backend -> client
+                  try {
+                    backendSocket.data.client.write(backendData);
+                  } catch (e) {
+                    // Client disconnected
+                    backendSocket.end();
+                  }
+                },
+                close(backendSocket) {
+                  console.log(`[tcp] Backend closed for ${socketData.subdomain}`);
+                  try {
+                    backendSocket.data.client.end();
+                  } catch (e) {
+                    // Already closed
+                  }
+                },
+                error(backendSocket, error) {
+                  console.log(`[tcp] Backend error for ${socketData.subdomain}: ${error.message}`);
+                  try {
+                    backendSocket.data.client.end();
+                  } catch (e) {
+                    // Already closed
+                  }
+                },
+                end(backendSocket) {
+                  try {
+                    backendSocket.data.client.end();
+                  } catch (e) {
+                    // Already closed
+                  }
+                },
+              },
+            });
+
+            socketData.backend = backend;
+          } catch (e) {
+            console.log(`[tcp] Failed to connect to backend: ${e}`);
+            socket.write(`HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nFailed to connect to backend\n`);
+            socket.end();
+          }
+        } else {
+          // Regular HTTP - use fetch() for proxying
+          const bodyStart = headerEndIndex!;
+          const body = socketData.buffer.slice(bodyStart);
+
+          // Reconstruct the URL
+          const url = `http://localhost:${socketData.targetPort}${path}`;
+
+          // Build headers for fetch
+          const fetchHeaders = new Headers();
+          for (const [key, value] of headers!) {
+            // Skip hop-by-hop headers
+            if (!["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade"].includes(key)) {
+              fetchHeaders.set(key, value);
+            }
+          }
+          // Strip conditional headers to avoid 304 loops
+          fetchHeaders.delete("if-none-match");
+          fetchHeaders.delete("if-modified-since");
+
+          try {
+            const response = await fetch(url, {
+              method: method,
+              headers: fetchHeaders,
+              body: method !== "GET" && method !== "HEAD" && body.length > 0 ? body : undefined,
+              redirect: "manual",
+            });
+
+            // Build response
+            let responseText = `HTTP/1.1 ${response.status} ${response.statusText}\r\n`;
+            for (const [key, value] of response.headers) {
+              // Skip hop-by-hop headers
+              if (!["connection", "keep-alive", "transfer-encoding"].includes(key.toLowerCase())) {
+                responseText += `${key}: ${value}\r\n`;
+              }
+            }
+            responseText += "Connection: close\r\n\r\n";
+
+            socket.write(responseText);
+
+            // Stream body
+            if (response.body) {
+              const reader = response.body.getReader();
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                socket.write(value);
+              }
+            }
+            socket.end();
+          } catch (e) {
+            socket.write(`HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nProxy error: ${e}\n`);
+            socket.end();
+          }
+        }
       }
     },
 
-    close(clientWs, code, reason) {
-      const { subdomain } = clientWs.data as { subdomain: string };
-      console.log(`[ws] Client closed for ${subdomain}: ${code}`);
+    close(socket) {
+      const socketData = socket.data;
+      if (socketData?.backend) {
+        console.log(`[tcp] Client closed for ${socketData.subdomain}`);
+        try {
+          socketData.backend.end();
+        } catch (e) {
+          // Already closed
+        }
+      }
+    },
 
-      const backendWs = wsBackends.get(clientWs);
-      if (backendWs) {
-        backendWs.close(code, reason);
-        wsBackends.delete(clientWs);
+    error(socket, error) {
+      const socketData = socket.data;
+      console.log(`[tcp] Client error: ${error.message}`);
+      if (socketData?.backend) {
+        try {
+          socketData.backend.end();
+        } catch (e) {
+          // Already closed
+        }
       }
     },
   },
