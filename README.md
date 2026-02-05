@@ -1,48 +1,23 @@
 # localhostess
 
-A macOS daemon that routes `*.localhost:9999` to local services based on environment variables.
-
-## The Problem
-
-You're running multiple dev servers on different ports. You forget which port is which.
-
-```
-localhost:3000  # is this the frontend?
-localhost:3001  # or is this one?
-localhost:8080  # api? docs?
-```
-
-## The Solution
-
-Set `NAME` when starting any server:
+Never remember a port again.
 
 ```bash
-NAME=frontend bun run dev
-NAME=api node server.js
-NAME=docs python -m http.server
+NAME=app npm run dev
 ```
 
-Access them at:
+Type `app/` in your browser. It just works. No ports. Just names.
 
-```
-http://frontend.localhost:9999
-http://api.localhost:9999
-http://docs.localhost:9999
-```
+You build tools for yourself — dashboards, APIs, little utilities with web UIs. But using them means remembering `localhost:3847` or digging through terminal tabs to find the right port. localhostess gives your local services real names so they're always one keystroke away.
 
-The daemon auto-discovers running servers and routes requests to the correct port.
-
-## Install
+## Setup
 
 ```bash
-# Clone and enter directory
-cd ~/projects/localhostess
-
-# Allow direnv (loads nix flake with bun + just)
-direnv allow
-
-# Install the launchd service (runs on startup)
+# 1. Install the daemon (runs on startup)
 just install
+
+# 2. Load the Chrome extension
+#    Open chrome://extensions → Developer mode → Load unpacked → select extension/
 ```
 
 ## Usage
@@ -50,86 +25,52 @@ just install
 Start any server with `NAME`:
 
 ```bash
-NAME=myapp bun run server.ts
-# Now accessible at http://myapp.localhost:9999
+NAME=frontend npm run dev
+NAME=api node server.js
+NAME=docs python -m http.server
 ```
 
-View all running services at http://localhost:9999
+Open your browser:
+
+```
+frontend/
+api/
+docs/
+```
+
+That's it. No ports to remember, no bookmarks to maintain. Name it, reach it.
+
+> Without the Chrome extension, services are still accessible at `name.localhost:9090`.
+
+## How It Works
+
+localhostess is a daemon that auto-discovers local processes by their `NAME` environment variable and routes traffic to them.
+
+The Chrome extension makes bare hostnames like `app/` route through localhostess. Unknown names fall back to normal resolution — golinks, DNS, and everything else still work.
+
+```
+NAME=app bun run dev        # starts on some port
+         ↓
+localhostess discovers it   # "app" → :3000
+         ↓
+browser: app/               # proxied to localhost:3000
+```
 
 ## Commands
 
 ```bash
 just run        # Run daemon in foreground
 just dev        # Run with watch mode
-
 just install    # Install launchd service
 just start      # Start service
 just stop       # Stop service
 just restart    # Restart service
-just status     # Check if running
-just logs       # Tail stdout log
-just errors     # Tail stderr log
-just uninstall  # Remove service
-
-just scan       # Debug: show discovered servers
-just build      # Compile to binary
+just logs       # Tail logs
+just scan       # Show discovered servers
 ```
-
-## Port Collision Tolerance
-
-You don't need to coordinate ports across projects. Every project can default to `:3000` — it doesn't matter.
-
-```bash
-# Project A uses port 3000
-cd ~/projects/frontend
-NAME=frontend bun run dev  # starts on :3000
-
-# Project B also wants port 3000? Just use a different one, who cares
-cd ~/projects/api
-NAME=api bun run dev  # starts on :3001
-
-# Access by name, not port
-http://frontend.localhost:9999  # → :3000
-http://api.localhost:9999       # → :3001
-```
-
-The port is an implementation detail. You never need to remember it.
-
-> **TIP:** Set `PORT=0` and your application will get a random available port from the OS. Since localhostess routes by name, you'll never have collisions:
-> ```bash
-> NAME=frontend PORT=0 bun run dev
-> NAME=api PORT=0 bun run dev
-> # Both start on random ports, both accessible by name
-> ```
-
-## How It Works
-
-1. Daemon listens on port 9999
-2. On each request, scans for processes with `NAME` env var
-3. Matches subdomain to process, finds its listening port
-4. Proxies the request
-
-```
-Request: frontend.localhost:9999
-    ↓
-Daemon finds process with NAME=frontend
-    ↓
-That process is listening on :3000
-    ↓
-Proxy request to localhost:3000
-```
-
-## Configuration
-
-The daemon uses sensible defaults. No config file needed.
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| Port | 9999 | Set via `PORT` env var |
-| Cache TTL | 5s | How often to re-scan for servers |
 
 ## Requirements
 
-- macOS (uses `lsof` and `ps -Eww` for process inspection)
-- Bun runtime
-- Modern browser (Chrome/Firefox/Safari resolve `*.localhost` automatically)
+- macOS
+- Bun
+- Chrome (for bare hostname routing via extension)
