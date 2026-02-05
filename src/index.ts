@@ -37,6 +37,8 @@ type SocketData = {
   host: string | null;
   subdomain: string | null;
   targetPort: number | null;
+  pendingWrite: Uint8Array | null; // data waiting for drain
+  endAfterFlush: boolean; // close socket after pendingWrite is flushed
 };
 
 type BackendData = {
@@ -141,6 +143,18 @@ Connection: close\r
   return html;
 }
 
+/** Write data to socket with backpressure handling, then close. */
+function writeAllAndEnd(socket: Socket<SocketData>, data: Uint8Array) {
+  const written = socket.write(data);
+  if (written < data.byteLength) {
+    // Couldn't write everything — stash remainder for drain handler
+    socket.data.pendingWrite = data.subarray(written);
+    socket.data.endAfterFlush = true;
+  } else {
+    socket.end();
+  }
+}
+
 const listener = Bun.listen<SocketData>({
   hostname: "0.0.0.0",
   port: PORT,
@@ -155,6 +169,8 @@ const listener = Bun.listen<SocketData>({
         host: null,
         subdomain: null,
         targetPort: null,
+        pendingWrite: null,
+        endAfterFlush: false,
       };
     },
 
@@ -393,7 +409,7 @@ const listener = Bun.listen<SocketData>({
               redirect: "manual",
             });
 
-            // Build response
+            // Build response headers
             let responseText = `HTTP/1.1 ${response.status} ${response.statusText}\r\n`;
             for (const [key, value] of response.headers) {
               // Skip hop-by-hop headers and content-length (fetch decompresses
@@ -405,22 +421,31 @@ const listener = Bun.listen<SocketData>({
             }
             responseText += "Connection: close\r\n\r\n";
 
-            socket.write(responseText);
-
-            // Stream body
-            if (response.body) {
-              const reader = response.body.getReader();
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                socket.write(value);
-              }
-            }
-            socket.end();
+            // Combine headers + body into one buffer so writeAllAndEnd
+            // can handle backpressure for the entire response
+            const headerBytes = new TextEncoder().encode(responseText);
+            const bodyBytes = new Uint8Array(await response.arrayBuffer());
+            const fullResp = new Uint8Array(headerBytes.byteLength + bodyBytes.byteLength);
+            fullResp.set(headerBytes, 0);
+            fullResp.set(bodyBytes, headerBytes.byteLength);
+            writeAllAndEnd(socket, fullResp);
           } catch (e) {
             socket.write(`HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nProxy error: ${e}\n`);
             socket.end();
           }
+        }
+      }
+    },
+
+    drain(socket) {
+      const socketData = socket.data;
+      if (socketData.pendingWrite) {
+        const written = socket.write(socketData.pendingWrite);
+        if (written < socketData.pendingWrite.byteLength) {
+          socketData.pendingWrite = socketData.pendingWrite.subarray(written);
+        } else {
+          socketData.pendingWrite = null;
+          if (socketData.endAfterFlush) socket.end();
         }
       }
     },

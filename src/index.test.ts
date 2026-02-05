@@ -350,7 +350,7 @@ describe("reverse proxy", () => {
   });
 
   test("HTTP — large response body arrives intact", async () => {
-    const size = 262144; // 256KB
+    const size = 4 * 1024 * 1024; // 4MB — large enough to trigger socket backpressure
     const resp = await retryRequest(
       () =>
         tcpRequest(
