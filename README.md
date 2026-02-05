@@ -1,4 +1,4 @@
-# localhostess
+# localhome
 
 Never remember a port again.
 
@@ -8,7 +8,7 @@ NAME=app npm run dev
 
 Type `app/` in your browser. It just works. No ports. Just names.
 
-You build tools for yourself — dashboards, APIs, little utilities with web UIs. But using them means remembering `localhost:3847` or digging through terminal tabs to find the right port. localhostess gives your local services real names so they're always one keystroke away.
+You build tools for yourself — dashboards, APIs, little utilities with web UIs. But using them means remembering `localhost:3847` or digging through terminal tabs to find the right port. localhome gives your local services real names so they're always one keystroke away.
 
 ## Setup
 
@@ -44,14 +44,14 @@ That's it. No ports to remember, no bookmarks to maintain. Name it, reach it.
 
 ## How It Works
 
-localhostess is a daemon that auto-discovers local processes by their `NAME` environment variable and routes traffic to them.
+localhome is a daemon that auto-discovers local processes by their `NAME` environment variable and routes traffic to them.
 
-The Chrome extension makes bare hostnames like `app/` route through localhostess. Unknown names fall back to normal resolution — golinks, DNS, and everything else still work.
+The Chrome extension makes bare hostnames like `app/` route through localhome. Unknown names fall back to normal resolution — golinks, DNS, and everything else still work.
 
 ```
 NAME=app bun run dev        # starts on some port
          ↓
-localhostess discovers it   # "app" → :3000
+localhome discovers it   # "app" → :3000
          ↓
 browser: app/               # proxied to localhost:3000
 ```

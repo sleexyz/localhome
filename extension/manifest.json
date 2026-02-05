@@ -1,6 +1,6 @@
 {
-  "name": "localhostess",
-  "description": "Route bare hostnames to localhostess proxy",
+  "name": "localhome",
+  "description": "Route bare hostnames to localhome proxy",
   "version": "1.0",
   "manifest_version": 3,
   "permissions": ["proxy"],

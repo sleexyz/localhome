@@ -1,5 +1,5 @@
 # launchd service name
-service := "com.slee2.localhostess"
+service := "com.slee2.localhome"
 plist := "~/Library/LaunchAgents/" + service + ".plist"
 
 # Show all commands
@@ -35,7 +35,7 @@ test-server:
 # Build binary
 [group('build')]
 build:
-    bun build src/index.ts --compile --outfile bin/localhostess
+    bun build src/index.ts --compile --outfile bin/localhome
 
 # Start the service
 [group('service')]
@@ -62,17 +62,17 @@ status:
 # View logs
 [group('service')]
 logs:
-    tail -f ~/Library/Logs/localhostess.log
+    tail -f ~/Library/Logs/localhome.log
 
 # View error logs
 [group('service')]
 errors:
-    tail -f ~/Library/Logs/localhostess.error.log
+    tail -f ~/Library/Logs/localhome.error.log
 
 # Install/reinstall the plist (copies from repo)
 [group('service')]
 install:
-    cp launchd/com.slee2.localhostess.plist {{plist}}
+    cp launchd/com.slee2.localhome.plist {{plist}}
     launchctl bootout gui/$(id -u)/{{service}} 2>/dev/null || true
     launchctl bootstrap gui/$(id -u) {{plist}}
     @echo "Installed and started. Check: just status"
@@ -82,4 +82,4 @@ install:
 uninstall:
     launchctl bootout gui/$(id -u)/{{service}} 2>/dev/null || true
     rm -f {{plist}}
-    @echo "Service uninstalled. Logs remain at ~/Library/Logs/localhostess*.log"
+    @echo "Service uninstalled. Logs remain at ~/Library/Logs/localhome*.log"

@@ -1,4 +1,4 @@
-# localhostess
+# localhome
 
 TCP-level proxy that routes `*.localhost` subdomains to local services discovered via `lsof`+`ps` (looking for `NAME` env var).
 

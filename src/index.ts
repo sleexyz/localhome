@@ -1,5 +1,5 @@
 /**
- * TCP-level proxy for localhostess
+ * TCP-level proxy for localhome
  * Handles WebSocket upgrades at the TCP level to avoid ECONNRESET issues
  */
 
@@ -468,6 +468,6 @@ const listener = Bun.listen<SocketData>({
 
 const actualPort = listener.port;
 console.log(`LISTENING:${actualPort}`);
-console.log(`localhostess (tcp mode) listening on http://localhost:${actualPort}`);
+console.log(`localhome (tcp mode) listening on http://localhost:${actualPort}`);
 console.log(`Dashboard: http://localhost:${actualPort}`);
 console.log(`\nStart services with: NAME=myapp bun run server.ts`);

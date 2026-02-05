@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.slee2.localhostess</string>
+    <string>com.slee2.localhome</string>
 
     <key>ProgramArguments</key>
     <array>
         <string>/etc/profiles/per-user/slee2/bin/bun</string>
         <string>run</string>
-        <string>/Users/slee2/projects/localhostess/src/index.ts</string>
+        <string>/Users/slee2/projects/localhome/src/index.ts</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -19,10 +19,10 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/slee2/Library/Logs/localhostess.log</string>
+    <string>/Users/slee2/Library/Logs/localhome.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/slee2/Library/Logs/localhostess.error.log</string>
+    <string>/Users/slee2/Library/Logs/localhome.error.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>

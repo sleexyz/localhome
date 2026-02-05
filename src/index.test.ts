@@ -329,7 +329,7 @@ describe("reverse proxy", () => {
     expect(parseStatusCode(upgradeResp)).toBe(101);
 
     // Send a text frame
-    const testMsg = "hello localhostess";
+    const testMsg = "hello localhome";
     sock.write(encodeWsFrame(testMsg));
 
     // Read echo frame

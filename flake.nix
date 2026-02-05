@@ -1,5 +1,5 @@
 {
-  description = "localhostess - Route *.localhost to local services";
+  description = "localhome - Route *.localhost to local services";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
