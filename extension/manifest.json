@@ -1,0 +1,10 @@
+{
+  "name": "localhostess",
+  "description": "Route bare hostnames to localhostess proxy",
+  "version": "1.0",
+  "manifest_version": 3,
+  "permissions": ["proxy"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

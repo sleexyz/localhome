@@ -183,11 +183,28 @@ Bun.listen<SocketData>({
         const { method, path, headers, headerEndIndex } = parsed;
 
         socketData.host = headers!.get("host") || null;
-        socketData.subdomain = extractSubdomain(socketData.host);
         socketData.isUpgrade = isWebSocketUpgrade(headers!);
+
+        // Detect proxy-style request (browser sending absolute URI via PAC)
+        let actualPath = path!;
+        let proxyTarget: string | null = null;
+
+        if (path!.startsWith("http://") || path!.startsWith("https://")) {
+          const targetUrl = new URL(path!);
+          proxyTarget = targetUrl.hostname;  // e.g. "mux"
+          actualPath = targetUrl.pathname + targetUrl.search;  // e.g. "/somepath?q=1"
+        }
+
+        socketData.subdomain = proxyTarget ?? extractSubdomain(socketData.host);
 
         // Dashboard request
         if (!socketData.subdomain || socketData.subdomain === "_") {
+          if (actualPath === "/proxy.pac") {
+            const pac = `HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nConnection: close\r\n\r\nfunction FindProxyForURL(url, host) {\n  if (host.indexOf(".") === -1 && host !== "localhost") {\n    return "PROXY " + host + ".localhost:${PORT}; DIRECT";\n  }\n  return "DIRECT";\n}\n`;
+            socket.write(pac);
+            socket.end();
+            return;
+          }
           const dashboard = await renderDashboard();
           socket.write(dashboard);
           socket.end();
@@ -199,6 +216,12 @@ Bun.listen<SocketData>({
         socketData.targetPort = mapping.get(socketData.subdomain) || null;
 
         if (!socketData.targetPort) {
+          if (proxyTarget) {
+            // Proxy request for unknown service — close without response
+            // This triggers PAC's "; DIRECT" fallback in the browser
+            socket.end();
+            return;
+          }
           socket.write(`HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNo server found for "${socketData.subdomain}.localhost"\n`);
           socket.end();
           return;
@@ -207,6 +230,20 @@ Bun.listen<SocketData>({
         if (socketData.isUpgrade) {
           // WebSocket upgrade - do TCP-level proxying
           console.log(`[tcp] WebSocket upgrade ${socketData.subdomain} -> :${socketData.targetPort}`);
+
+          // Rewrite request for backend: absolute URI → relative path, fix Host header
+          if (proxyTarget) {
+            let rawStr = socketData.buffer.toString("utf8");
+            rawStr = rawStr.replace(
+              `${method} ${path} `,
+              `${method} ${actualPath} `
+            );
+            rawStr = rawStr.replace(
+              /^Host: .+$/m,
+              `Host: localhost:${socketData.targetPort}`
+            );
+            socketData.buffer = Buffer.from(rawStr);
+          }
 
           try {
             const backend = await Bun.connect<BackendData>({
@@ -265,7 +302,7 @@ Bun.listen<SocketData>({
           const body = socketData.buffer.slice(bodyStart);
 
           // Reconstruct the URL
-          const url = `http://localhost:${socketData.targetPort}${path}`;
+          const url = `http://localhost:${socketData.targetPort}${actualPath}`;
 
           // Build headers for fetch
           const fetchHeaders = new Headers();
@@ -278,6 +315,10 @@ Bun.listen<SocketData>({
           // Strip conditional headers to avoid 304 loops
           fetchHeaders.delete("if-none-match");
           fetchHeaders.delete("if-modified-since");
+          // Rewrite Host header for proxy requests so backends accept it
+          if (proxyTarget) {
+            fetchHeaders.set("host", `localhost:${socketData.targetPort}`);
+          }
 
           try {
             const response = await fetch(url, {
