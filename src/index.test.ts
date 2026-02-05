@@ -349,6 +349,27 @@ describe("reverse proxy", () => {
     sock.destroy();
   });
 
+  test("HTTP — large response body arrives intact", async () => {
+    const size = 262144; // 256KB
+    const resp = await retryRequest(
+      () =>
+        tcpRequest(
+          daemonPort,
+          `GET /big?n=${size} HTTP/1.1\r\nHost: testapp.localhost:${daemonPort}\r\n\r\n`,
+          { timeout: 10_000 }
+        ),
+      (r) => parseStatusCode(r) === 200
+    );
+
+    expect(parseStatusCode(resp)).toBe(200);
+    const body = parseBody(resp);
+    expect(body.length).toBe(size);
+    // Verify content matches expected pattern
+    const chunk = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\n";
+    const expected = chunk.repeat(Math.ceil(size / chunk.length)).slice(0, size);
+    expect(body).toBe(expected);
+  });
+
   test("unknown service returns 404", async () => {
     const resp = await tcpRequest(
       daemonPort,
@@ -403,6 +424,8 @@ describe("forward proxy", () => {
     expect(parseStatusCode(tunnelResp)).toBe(200);
     const body = JSON.parse(parseBody(tunnelResp));
     expect(body.name).toBe("testapp");
+    // Host header should be rewritten to localhost:<port> so backends accept it
+    expect(body.headers.host).toBe(`localhost:${backendPort}`);
 
     sock.destroy();
   });

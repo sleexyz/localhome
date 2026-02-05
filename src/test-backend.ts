@@ -13,6 +13,15 @@ const server = Bun.serve({
   fetch(req, server) {
     if (server.upgrade(req)) return undefined;
     const url = new URL(req.url);
+    // /big?n=<bytes> — return a known repeating pattern of that size
+    if (url.pathname === "/big") {
+      const n = parseInt(url.searchParams.get("n") || "262144", 10);
+      const chunk = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\n";
+      const body = chunk.repeat(Math.ceil(n / chunk.length)).slice(0, n);
+      return new Response(body, {
+        headers: { "content-type": "text/plain" },
+      });
+    }
     return Response.json({
       name: NAME,
       path: url.pathname,

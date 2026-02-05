@@ -41,6 +41,7 @@ type SocketData = {
 
 type BackendData = {
   client: Socket<SocketData>;
+  rewriteHost?: string; // if set, rewrite Host header on first client chunk
 };
 
 function parseHttpHeaders(data: Buffer): {
@@ -162,6 +163,15 @@ const listener = Bun.listen<SocketData>({
 
       // If we already have a backend connection, just forward data
       if (socketData.backend) {
+        // Rewrite Host header on the first chunk through a CONNECT tunnel
+        // so backends (Vite etc.) don't reject the unfamiliar hostname
+        if (socketData.backend.data.rewriteHost) {
+          const newHost = socketData.backend.data.rewriteHost;
+          socketData.backend.data.rewriteHost = undefined;
+          const str = Buffer.isBuffer(data) ? data.toString("utf8") : new TextDecoder().decode(data);
+          socketData.backend.write(str.replace(/^Host: .+$/m, `Host: ${newHost}`));
+          return;
+        }
         socketData.backend.write(data);
         return;
       }
@@ -204,7 +214,10 @@ const listener = Bun.listen<SocketData>({
               port: targetPort,
               socket: {
                 open(backendSocket) {
-                  backendSocket.data = { client: socket };
+                  backendSocket.data = {
+                    client: socket,
+                    rewriteHost: `localhost:${targetPort}`,
+                  };
                   // Tell client the tunnel is ready — browser sends real request next
                   socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
                 },
@@ -383,8 +396,10 @@ const listener = Bun.listen<SocketData>({
             // Build response
             let responseText = `HTTP/1.1 ${response.status} ${response.statusText}\r\n`;
             for (const [key, value] of response.headers) {
-              // Skip hop-by-hop headers
-              if (!["connection", "keep-alive", "transfer-encoding"].includes(key.toLowerCase())) {
+              // Skip hop-by-hop headers and content-length (fetch decompresses
+              // gzip/br bodies so the original content-length is wrong;
+              // Connection: close signals end-of-body instead)
+              if (!["connection", "keep-alive", "transfer-encoding", "content-length"].includes(key.toLowerCase())) {
                 responseText += `${key}: ${value}\r\n`;
               }
             }
