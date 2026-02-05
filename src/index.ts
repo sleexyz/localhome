@@ -185,6 +185,62 @@ Bun.listen<SocketData>({
         socketData.host = headers!.get("host") || null;
         socketData.isUpgrade = isWebSocketUpgrade(headers!);
 
+        // Handle CONNECT tunnel (browsers use this for WebSocket/HTTPS through forward proxy)
+        if (method === "CONNECT") {
+          const connectHost = path!.split(":")[0]; // "mux" from "mux:80"
+
+          const mapping = await getMapping();
+          const targetPort = mapping.get(connectHost);
+
+          if (!targetPort) {
+            // Unknown service — close so browser falls back to DIRECT
+            socket.end();
+            return;
+          }
+
+          socketData.subdomain = connectHost;
+          socketData.targetPort = targetPort;
+          console.log(`[tcp] CONNECT tunnel ${connectHost} -> :${targetPort}`);
+
+          try {
+            const backend = await Bun.connect<BackendData>({
+              hostname: "localhost",
+              port: targetPort,
+              socket: {
+                open(backendSocket) {
+                  backendSocket.data = { client: socket };
+                  // Tell client the tunnel is ready — browser sends real request next
+                  socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+                },
+                data(backendSocket, backendData) {
+                  try {
+                    backendSocket.data.client.write(backendData);
+                  } catch (e) {
+                    backendSocket.end();
+                  }
+                },
+                close(backendSocket) {
+                  try { backendSocket.data.client.end(); } catch (e) {}
+                },
+                error(backendSocket, error) {
+                  console.log(`[tcp] CONNECT backend error for ${connectHost}: ${error.message}`);
+                  try { backendSocket.data.client.end(); } catch (e) {}
+                },
+                end(backendSocket) {
+                  try { backendSocket.data.client.end(); } catch (e) {}
+                },
+              },
+            });
+
+            socketData.backend = backend;
+          } catch (e) {
+            console.log(`[tcp] CONNECT failed for ${connectHost}: ${e}`);
+            socket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+            socket.end();
+          }
+          return;
+        }
+
         // Detect proxy-style request (browser sending absolute URI via PAC)
         let actualPath = path!;
         let proxyTarget: string | null = null;
