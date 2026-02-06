@@ -10,12 +10,12 @@ default:
 # Run the daemon
 [group('dev')]
 run:
-    bun run src/index.ts
+    NAME=localhome bun run src/index.ts
 
 # Run with watch mode
 [group('dev')]
 dev:
-    bun run --watch src/index.ts
+    NAME=localhome bun run --watch src/index.ts
 
 # Run tests
 [group('test')]

@@ -204,8 +204,8 @@ const listener = Bun.listen<SocketData>({
           const mapping = await getMapping();
           const targetPort = mapping.get(connectHost);
 
-          if (!targetPort) {
-            // Unknown service — close so browser falls back to DIRECT
+          if (!targetPort || targetPort === listener.port) {
+            // Unknown or self-referential — close so browser falls back to DIRECT
             socket.end();
             return;
           }
@@ -268,8 +268,19 @@ const listener = Bun.listen<SocketData>({
 
         socketData.subdomain = proxyTarget ?? extractSubdomain(socketData.host);
 
-        // Dashboard request
-        if (!socketData.subdomain || socketData.subdomain === "_" || socketData.subdomain === "home") {
+        // Determine if this is a dashboard request
+        let isDashboard = !socketData.subdomain;
+
+        if (!isDashboard) {
+          const mapping = await getMapping();
+          socketData.targetPort = mapping.get(socketData.subdomain!) || null;
+          // Self-referential: target resolves to our own port
+          if (socketData.targetPort === listener.port) {
+            isDashboard = true;
+          }
+        }
+
+        if (isDashboard) {
           if (actualPath === "/proxy.pac") {
             const pac = `HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nConnection: close\r\n\r\nfunction FindProxyForURL(url, host) {\n  if (host.indexOf(".") === -1 && host !== "localhost") {\n    return "PROXY " + host + ".localhost:${listener.port}; DIRECT";\n  }\n  return "DIRECT";\n}\n`;
             socket.write(pac);
@@ -281,10 +292,6 @@ const listener = Bun.listen<SocketData>({
           socket.end();
           return;
         }
-
-        // Look up target port
-        const mapping = await getMapping();
-        socketData.targetPort = mapping.get(socketData.subdomain) || null;
 
         if (!socketData.targetPort) {
           if (proxyTarget) {
@@ -405,7 +412,7 @@ const listener = Bun.listen<SocketData>({
               // Skip hop-by-hop headers and content-length (fetch decompresses
               // gzip/br bodies so the original content-length is wrong;
               // Connection: close signals end-of-body instead)
-              if (!["connection", "keep-alive", "transfer-encoding", "content-length"].includes(key.toLowerCase())) {
+              if (!["connection", "keep-alive", "transfer-encoding", "content-length", "content-encoding"].includes(key.toLowerCase())) {
                 responseText += `${key}: ${value}\r\n`;
               }
             }

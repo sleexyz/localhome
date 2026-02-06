@@ -279,7 +279,7 @@ beforeAll(async () => {
   const bun = process.argv[0]; // path to bun
 
   const [d, b] = await Promise.all([
-    spawnAndGetPort(bun, ["src/index.ts"], { PORT: "0" }),
+    spawnAndGetPort(bun, ["src/index.ts"], { PORT: "0", NAME: "localhome" }),
     spawnAndGetPort(bun, ["src/test-backend.ts"], {
       PORT: "0",
       NAME: "testapp",
@@ -460,19 +460,27 @@ describe("dashboard & PAC", () => {
     expect(parseBody(resp)).toContain("localhome");
   });
 
-  test("home.localhost serves dashboard (reverse proxy)", async () => {
-    const resp = await tcpRequest(
-      daemonPort,
-      `GET / HTTP/1.1\r\nHost: home.localhost:${daemonPort}\r\n\r\n`
+  test("localhome.localhost serves dashboard (reverse proxy, self-discovery)", async () => {
+    const resp = await retryRequest(
+      () =>
+        tcpRequest(
+          daemonPort,
+          `GET / HTTP/1.1\r\nHost: localhome.localhost:${daemonPort}\r\n\r\n`
+        ),
+      (r) => parseStatusCode(r) === 200
     );
     expect(parseStatusCode(resp)).toBe(200);
     expect(parseBody(resp)).toContain("localhome");
   });
 
-  test("http://home/ serves dashboard (forward proxy)", async () => {
-    const resp = await tcpRequest(
-      daemonPort,
-      `GET http://home/ HTTP/1.1\r\nHost: home\r\n\r\n`
+  test("http://localhome/ serves dashboard (forward proxy, self-discovery)", async () => {
+    const resp = await retryRequest(
+      () =>
+        tcpRequest(
+          daemonPort,
+          `GET http://localhome/ HTTP/1.1\r\nHost: localhome\r\n\r\n`
+        ),
+      (r) => parseStatusCode(r) === 200
     );
     expect(parseStatusCode(resp)).toBe(200);
     expect(parseBody(resp)).toContain("localhome");
