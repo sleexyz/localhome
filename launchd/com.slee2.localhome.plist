@@ -31,7 +31,7 @@
         <key>PATH</key>
         <string>/etc/profiles/per-user/slee2/bin:/run/current-system/sw/bin:/usr/sbin:/usr/bin:/bin:/sbin</string>
         <key>NAME</key>
-        <string>localhome</string>
+        <string>home</string>
         <key>LANG</key>
         <string>en_US.UTF-8</string>
         <key>LC_ALL</key>

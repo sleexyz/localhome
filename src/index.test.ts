@@ -279,7 +279,7 @@ beforeAll(async () => {
   const bun = process.argv[0]; // path to bun
 
   const [d, b] = await Promise.all([
-    spawnAndGetPort(bun, ["src/index.ts"], { PORT: "0", NAME: "localhome" }),
+    spawnAndGetPort(bun, ["src/index.ts"], { PORT: "0", NAME: "home" }),
     spawnAndGetPort(bun, ["src/test-backend.ts"], {
       PORT: "0",
       NAME: "testapp",
@@ -568,12 +568,12 @@ describe("dashboard & PAC", () => {
     expect(parseBody(resp)).toContain("localhome");
   });
 
-  test("http://localhome/ serves dashboard (forward proxy, self-discovery)", async () => {
+  test("http://home/ serves dashboard (forward proxy, self-discovery)", async () => {
     const resp = await retryRequest(
       () =>
         tcpRequest(
           daemonPort,
-          `GET http://localhome/ HTTP/1.1\r\nHost: localhome\r\n\r\n`
+          `GET http://home/ HTTP/1.1\r\nHost: home\r\n\r\n`
         ),
       (r) => parseStatusCode(r) === 200
     );
