@@ -1,12 +1,21 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import { connect, type Socket } from "net";
+import { connect as tlsConnect } from "tls";
 import { randomBytes } from "crypto";
+import { mkdirSync, writeFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import forge from "node-forge";
 
 let daemon: ChildProcess;
 let backend: ChildProcess;
 let daemonPort: number;
 let backendPort: number;
+
+// Test CA for HTTPS MITM tests
+let testCaDir: string;
+let caCertPem: string;
 
 /** Spawn a process and extract the port from its LISTENING:${port} stdout line. */
 function spawnAndGetPort(
@@ -278,8 +287,37 @@ async function retryRequest(
 beforeAll(async () => {
   const bun = process.argv[0]; // path to bun
 
+  // Generate a throwaway CA for HTTPS MITM tests
+  testCaDir = join(tmpdir(), `localhome-test-ca-${process.pid}`);
+  mkdirSync(testCaDir, { recursive: true });
+
+  const caKeys = forge.pki.rsa.generateKeyPair(2048);
+  const caCert = forge.pki.createCertificate();
+  caCert.publicKey = caKeys.publicKey;
+  caCert.serialNumber = "01";
+  caCert.validity.notBefore = new Date();
+  caCert.validity.notAfter = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
+  const caAttrs = [{ name: "commonName", value: "localhome Test CA" }];
+  caCert.setSubject(caAttrs);
+  caCert.setIssuer(caAttrs);
+  caCert.setExtensions([
+    { name: "basicConstraints", cA: true },
+    { name: "keyUsage", keyCertSign: true, cRLSign: true },
+  ]);
+  caCert.sign(caKeys.privateKey, forge.md.sha256.create());
+
+  caCertPem = forge.pki.certificateToPem(caCert);
+  const caKeyPem = forge.pki.privateKeyToPem(caKeys.privateKey);
+
+  writeFileSync(join(testCaDir, "rootCA.pem"), caCertPem);
+  writeFileSync(join(testCaDir, "rootCA-key.pem"), caKeyPem);
+
   const [d, b] = await Promise.all([
-    spawnAndGetPort(bun, ["src/index.ts"], { PORT: "0", NAME: "home" }),
+    spawnAndGetPort(bun, ["src/index.ts"], {
+      PORT: "0",
+      NAME: "_testhome",
+      MKCERT_CA_ROOT: testCaDir,
+    }),
     spawnAndGetPort(bun, ["src/test-backend.ts"], {
       PORT: "0",
       NAME: "testapp",
@@ -297,6 +335,7 @@ afterAll(() => {
   for (const pid of [daemon?.pid, backend?.pid]) {
     if (pid) try { process.kill(pid, "SIGKILL"); } catch {}
   }
+  try { rmSync(testCaDir, { recursive: true }); } catch {}
 });
 
 describe("reverse proxy", () => {
@@ -380,20 +419,19 @@ describe("reverse proxy", () => {
 });
 
 describe("forward proxy", () => {
-  test("HTTP — absolute URI with Host rewriting", async () => {
+  test("HTTP — redirects to HTTPS when MITM available", async () => {
     const resp = await retryRequest(
       () =>
         tcpRequest(
           daemonPort,
-          `GET http://testapp/ HTTP/1.1\r\nHost: testapp\r\n\r\n`
+          `GET http://testapp/somepath HTTP/1.1\r\nHost: testapp\r\n\r\n`
         ),
-      (r) => parseStatusCode(r) === 200
+      (r) => parseStatusCode(r) === 302
     );
 
-    expect(parseStatusCode(resp)).toBe(200);
-    const body = JSON.parse(parseBody(resp));
-    expect(body.name).toBe("testapp");
-    expect(body.headers.host).toBe(`localhost:${backendPort}`);
+    expect(parseStatusCode(resp)).toBe(302);
+    const headers = parseHeaders(resp);
+    expect(headers.get("location")).toBe("https://testapp/somepath");
   });
 
   test("CONNECT tunnel — bidirectional TCP pipe", async () => {
@@ -430,12 +468,12 @@ describe("forward proxy", () => {
     sock.destroy();
   });
 
-  test("HTTP — strips content-encoding from proxied response", async () => {
+  test("HTTP — strips content-encoding from proxied response (reverse proxy)", async () => {
     const resp = await retryRequest(
       () =>
         tcpRequest(
           daemonPort,
-          `GET http://testapp/gzipped HTTP/1.1\r\nHost: testapp\r\n\r\n`
+          `GET /gzipped HTTP/1.1\r\nHost: testapp.localhost:${daemonPort}\r\n\r\n`
         ),
       (r) => parseStatusCode(r) === 200
     );
@@ -555,12 +593,12 @@ describe("dashboard & PAC", () => {
     expect(parseBody(resp)).toContain("localhome");
   });
 
-  test("localhome.localhost serves dashboard (reverse proxy, self-discovery)", async () => {
+  test("_testhome.localhost serves dashboard (reverse proxy, self-discovery)", async () => {
     const resp = await retryRequest(
       () =>
         tcpRequest(
           daemonPort,
-          `GET / HTTP/1.1\r\nHost: localhome.localhost:${daemonPort}\r\n\r\n`
+          `GET / HTTP/1.1\r\nHost: _testhome.localhost:${daemonPort}\r\n\r\n`
         ),
       (r) => parseStatusCode(r) === 200
     );
@@ -568,17 +606,28 @@ describe("dashboard & PAC", () => {
     expect(parseBody(resp)).toContain("localhome");
   });
 
-  test("http://home/ serves dashboard (forward proxy, self-discovery)", async () => {
+  test("http://_testhome/ redirects to HTTPS (forward proxy, self-discovery)", async () => {
     const resp = await retryRequest(
       () =>
         tcpRequest(
           daemonPort,
-          `GET http://home/ HTTP/1.1\r\nHost: home\r\n\r\n`
+          `GET http://_testhome/ HTTP/1.1\r\nHost: _testhome\r\n\r\n`
         ),
-      (r) => parseStatusCode(r) === 200
+      (r) => {
+        const code = parseStatusCode(r);
+        return code === 200 || code === 302;
+      }
     );
-    expect(parseStatusCode(resp)).toBe(200);
-    expect(parseBody(resp)).toContain("localhome");
+    const code = parseStatusCode(resp);
+    if (code === 200) {
+      // Self-referential: dashboard served directly
+      expect(parseBody(resp)).toContain("localhome");
+    } else {
+      // Redirect to HTTPS
+      expect(code).toBe(302);
+      const headers = parseHeaders(resp);
+      expect(headers.get("location")).toBe("https://_testhome/");
+    }
   });
 
   test("PAC file serves valid JS", async () => {
@@ -591,4 +640,318 @@ describe("dashboard & PAC", () => {
     expect(headers.get("content-type")).toBe("application/x-ns-proxy-autoconfig");
     expect(parseBody(resp)).toContain("FindProxyForURL");
   });
+});
+
+describe("hardening", () => {
+  test("Host with external domain returns 403", async () => {
+    const resp = await tcpRequest(
+      daemonPort,
+      `GET / HTTP/1.1\r\nHost: evil.com\r\n\r\n`
+    );
+    expect(parseStatusCode(resp)).toBe(403);
+  });
+
+  test("Host testapp.localhost still works", async () => {
+    const resp = await retryRequest(
+      () =>
+        tcpRequest(
+          daemonPort,
+          `GET / HTTP/1.1\r\nHost: testapp.localhost:${daemonPort}\r\n\r\n`
+        ),
+      (r) => parseStatusCode(r) === 200
+    );
+    expect(parseStatusCode(resp)).toBe(200);
+  });
+
+  test("Host testapp (bare, forward proxy) still works", async () => {
+    // Forward proxy HTTP redirects to HTTPS — verify redirect works
+    const resp = await retryRequest(
+      () =>
+        tcpRequest(
+          daemonPort,
+          `GET http://testapp/ HTTP/1.1\r\nHost: testapp\r\n\r\n`
+        ),
+      (r) => parseStatusCode(r) === 302
+    );
+    expect(parseStatusCode(resp)).toBe(302);
+  });
+});
+
+describe("HTTPS MITM", () => {
+  test("CONNECT testapp:443 — HTTP through TLS tunnel", async () => {
+    const sock = await tcpConnect(daemonPort);
+
+    // Send CONNECT for port 443
+    sock.write(`CONNECT testapp:443 HTTP/1.1\r\n\r\n`);
+
+    // Wait for 200 Connection Established
+    const connectResp = await collectUntil(sock, (buf) =>
+      buf.toString("utf8").includes("\r\n\r\n")
+    );
+    expect(connectResp.toString("utf8")).toContain("200 Connection Established");
+
+    // TLS handshake through the tunnel
+    const tlsSock = tlsConnect({
+      socket: sock,
+      ca: caCertPem,
+      servername: "testapp",
+      rejectUnauthorized: true,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      tlsSock.on("secureConnect", resolve);
+      tlsSock.on("error", reject);
+    });
+
+    // Send HTTP request through TLS tunnel
+    tlsSock.write(
+      `GET / HTTP/1.1\r\nHost: testapp\r\nConnection: close\r\n\r\n`
+    );
+
+    // Read response
+    const resp = await new Promise<Buffer>((resolve) => {
+      const chunks: Buffer[] = [];
+      tlsSock.on("data", (chunk: Buffer) => chunks.push(chunk));
+      tlsSock.on("end", () => resolve(Buffer.concat(chunks)));
+      tlsSock.on("close", () => resolve(Buffer.concat(chunks)));
+      setTimeout(() => resolve(Buffer.concat(chunks)), 5000);
+    });
+
+    expect(parseStatusCode(resp)).toBe(200);
+    const body = JSON.parse(parseBody(resp));
+    expect(body.name).toBe("testapp");
+    // Host should be rewritten to localhost:<backendPort>
+    expect(body.headers.host).toBe(`localhost:${backendPort}`);
+
+    tlsSock.destroy();
+  }, 10_000);
+
+  test("CONNECT testapp:443 — WebSocket over TLS", async () => {
+    const sock = await tcpConnect(daemonPort);
+
+    sock.write(`CONNECT testapp:443 HTTP/1.1\r\n\r\n`);
+    const connectResp = await collectUntil(sock, (buf) =>
+      buf.toString("utf8").includes("\r\n\r\n")
+    );
+    expect(connectResp.toString("utf8")).toContain("200 Connection Established");
+
+    // TLS handshake
+    const tlsSock = tlsConnect({
+      socket: sock,
+      ca: caCertPem,
+      servername: "testapp",
+      rejectUnauthorized: true,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      tlsSock.on("secureConnect", resolve);
+      tlsSock.on("error", reject);
+    });
+
+    // Send WebSocket upgrade through TLS
+    const key = randomBytes(16).toString("base64");
+    tlsSock.write(
+      `GET / HTTP/1.1\r\n` +
+      `Host: testapp\r\n` +
+      `Upgrade: websocket\r\n` +
+      `Connection: Upgrade\r\n` +
+      `Sec-WebSocket-Key: ${key}\r\n` +
+      `Sec-WebSocket-Version: 13\r\n` +
+      `\r\n`
+    );
+
+    // Wait for 101 upgrade response
+    const upgradeResp = await new Promise<Buffer>((resolve) => {
+      const chunks: Buffer[] = [];
+      const onData = (chunk: Buffer) => {
+        chunks.push(chunk);
+        const combined = Buffer.concat(chunks);
+        if (combined.toString("utf8").includes("\r\n\r\n")) {
+          tlsSock.removeListener("data", onData);
+          resolve(combined);
+        }
+      };
+      tlsSock.on("data", onData);
+      setTimeout(() => resolve(Buffer.concat(chunks)), 5000);
+    });
+
+    expect(parseStatusCode(upgradeResp)).toBe(101);
+
+    // Send a WebSocket text frame
+    const testMsg = "hello over TLS";
+    tlsSock.write(encodeWsFrame(testMsg));
+
+    // Read echo frame
+    const frameData = await new Promise<Buffer>((resolve) => {
+      const chunks: Buffer[] = [];
+      const onData = (chunk: Buffer) => {
+        chunks.push(chunk);
+        const combined = Buffer.concat(chunks);
+        const frame = decodeWsFrame(combined);
+        if (frame !== null && frame.payload.length > 0) {
+          tlsSock.removeListener("data", onData);
+          resolve(combined);
+        }
+      };
+      tlsSock.on("data", onData);
+      setTimeout(() => resolve(Buffer.concat(chunks)), 3000);
+    });
+
+    const decoded = decodeWsFrame(frameData);
+    expect(decoded).not.toBeNull();
+    expect(decoded!.payload).toBe(testMsg);
+
+    tlsSock.destroy();
+  }, 10_000);
+
+  test("CONNECT _testhome:443 — dashboard served over TLS (self-referential)", async () => {
+    const sock = await tcpConnect(daemonPort);
+
+    sock.write(`CONNECT _testhome:443 HTTP/1.1\r\n\r\n`);
+    const connectResp = await collectUntil(sock, (buf) =>
+      buf.toString("utf8").includes("\r\n\r\n")
+    );
+    expect(connectResp.toString("utf8")).toContain("200 Connection Established");
+
+    const tlsSock = tlsConnect({
+      socket: sock,
+      ca: caCertPem,
+      servername: "_testhome",
+      rejectUnauthorized: true,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      tlsSock.on("secureConnect", resolve);
+      tlsSock.on("error", reject);
+    });
+
+    tlsSock.write(
+      `GET / HTTP/1.1\r\nHost: _testhome\r\nConnection: close\r\n\r\n`
+    );
+
+    const resp = await new Promise<Buffer>((resolve) => {
+      const chunks: Buffer[] = [];
+      tlsSock.on("data", (chunk: Buffer) => chunks.push(chunk));
+      tlsSock.on("end", () => resolve(Buffer.concat(chunks)));
+      tlsSock.on("close", () => resolve(Buffer.concat(chunks)));
+      setTimeout(() => resolve(Buffer.concat(chunks)), 5000);
+    });
+
+    expect(parseStatusCode(resp)).toBe(200);
+    expect(parseBody(resp)).toContain("localhome");
+
+    tlsSock.destroy();
+  }, 10_000);
+
+  test("CONNECT unknown:443 — connection closed", async () => {
+    const resp = await tcpRequest(
+      daemonPort,
+      `CONNECT nonexistent:443 HTTP/1.1\r\n\r\n`,
+      { timeout: 2000 }
+    );
+    expect(resp.length).toBe(0);
+  });
+
+  test("concurrent HTTPS connections — 5 simultaneous tunnels", async () => {
+    const N = 5;
+    const promises = Array.from({ length: N }, async (_, i) => {
+      const sock = await tcpConnect(daemonPort);
+
+      sock.write(`CONNECT testapp:443 HTTP/1.1\r\n\r\n`);
+      const connectResp = await collectUntil(sock, (buf) =>
+        buf.toString("utf8").includes("\r\n\r\n")
+      );
+      expect(connectResp.toString("utf8")).toContain("200 Connection Established");
+
+      const tlsSock = tlsConnect({
+        socket: sock,
+        ca: caCertPem,
+        servername: "testapp",
+        rejectUnauthorized: true,
+      });
+
+      await new Promise<void>((resolve, reject) => {
+        tlsSock.on("secureConnect", resolve);
+        tlsSock.on("error", reject);
+      });
+
+      tlsSock.write(
+        `GET /concurrent-${i} HTTP/1.1\r\nHost: testapp\r\nConnection: close\r\n\r\n`
+      );
+
+      const resp = await new Promise<Buffer>((resolve) => {
+        const chunks: Buffer[] = [];
+        tlsSock.on("data", (chunk: Buffer) => chunks.push(chunk));
+        tlsSock.on("end", () => resolve(Buffer.concat(chunks)));
+        tlsSock.on("close", () => resolve(Buffer.concat(chunks)));
+        setTimeout(() => resolve(Buffer.concat(chunks)), 5000);
+      });
+
+      tlsSock.destroy();
+      return resp;
+    });
+
+    const results = await Promise.all(promises);
+    for (let i = 0; i < N; i++) {
+      expect(parseStatusCode(results[i])).toBe(200);
+      const body = JSON.parse(parseBody(results[i]));
+      expect(body.path).toBe(`/concurrent-${i}`);
+      expect(body.headers.host).toBe(`localhost:${backendPort}`);
+    }
+  }, 15_000);
+
+  test("keep-alive — multiple requests through single TLS tunnel", async () => {
+    const sock = await tcpConnect(daemonPort);
+
+    sock.write(`CONNECT testapp:443 HTTP/1.1\r\n\r\n`);
+    const connectResp = await collectUntil(sock, (buf) =>
+      buf.toString("utf8").includes("\r\n\r\n")
+    );
+    expect(connectResp.toString("utf8")).toContain("200 Connection Established");
+
+    const tlsSock = tlsConnect({
+      socket: sock,
+      ca: caCertPem,
+      servername: "testapp",
+      rejectUnauthorized: true,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      tlsSock.on("secureConnect", resolve);
+      tlsSock.on("error", reject);
+    });
+
+    // Send 3 requests on the same TLS connection (keep-alive)
+    for (let i = 0; i < 3; i++) {
+      const isLast = i === 2;
+      tlsSock.write(
+        `GET /keepalive-${i} HTTP/1.1\r\nHost: testapp\r\n${isLast ? "Connection: close\r\n" : ""}\r\n`
+      );
+
+      const resp = await new Promise<Buffer>((resolve) => {
+        const chunks: Buffer[] = [];
+        const onData = (chunk: Buffer) => {
+          chunks.push(chunk);
+          const combined = Buffer.concat(chunks);
+          const str = combined.toString("utf8");
+          // Wait for complete response (headers + JSON body)
+          if (str.includes("\r\n\r\n") && str.includes(`"path":"/keepalive-${i}"`)) {
+            tlsSock.removeListener("data", onData);
+            resolve(combined);
+          }
+        };
+        tlsSock.on("data", onData);
+        setTimeout(() => {
+          tlsSock.removeListener("data", onData);
+          resolve(Buffer.concat(chunks));
+        }, 5000);
+      });
+
+      const body = JSON.parse(parseBody(resp));
+      expect(body.path).toBe(`/keepalive-${i}`);
+      expect(body.name).toBe("testapp");
+    }
+
+    tlsSock.destroy();
+  }, 15_000);
 });

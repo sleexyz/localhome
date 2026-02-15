@@ -7,3 +7,9 @@ polo-go-rewrite.log
 
 ralph-tests.log
 polo-tests.log
+
+ralph-b1-tls.log
+polo-b1-tls.log
+
+ralph-b4-tls.log
+polo-b4-tls.log

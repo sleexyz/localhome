@@ -4,6 +4,18 @@
  */
 
 import { buildMapping } from "./scan";
+import {
+  type SocketData,
+  type BackendData,
+  parseHttpHeaders,
+  isWebSocketUpgrade,
+  writeAllAndEnd,
+  makeBackendSocketHandlers,
+  proxyHttpRequest,
+  proxyWebSocket,
+} from "./proxy";
+import type { Server, ServerWebSocket } from "bun";
+import { loadCA, isMitmAvailable, getCert } from "./certs";
 import type { Socket } from "bun";
 
 const PORT = parseInt(process.env.PORT || "9090", 10);
@@ -29,64 +41,14 @@ function extractSubdomain(host: string | null): string | null {
   return hostname.slice(0, -".localhost".length) || null;
 }
 
-type SocketData = {
-  buffer: Buffer;
-  headersParsed: boolean;
-  isUpgrade: boolean;
-  backend: Socket<BackendData> | null;
-  host: string | null;
-  subdomain: string | null;
-  targetPort: number | null;
-  pendingWrite: Uint8Array | null; // data waiting for drain
-  endAfterFlush: boolean; // close socket after pendingWrite is flushed
-};
-
-type BackendData = {
-  client: Socket<SocketData>;
-  rewriteHost?: string; // if set, rewrite Host header on first client chunk
-};
-
-function parseHttpHeaders(data: Buffer): {
-  complete: boolean;
-  method?: string;
-  path?: string;
-  headers?: Map<string, string>;
-  headerEndIndex?: number;
-} {
-  const str = data.toString("utf8");
-  const headerEnd = str.indexOf("\r\n\r\n");
-  if (headerEnd === -1) {
-    return { complete: false };
-  }
-
-  const headerSection = str.slice(0, headerEnd);
-  const lines = headerSection.split("\r\n");
-  const [method, path] = lines[0].split(" ");
-
-  const headers = new Map<string, string>();
-  for (let i = 1; i < lines.length; i++) {
-    const colonIdx = lines[i].indexOf(":");
-    if (colonIdx > 0) {
-      const key = lines[i].slice(0, colonIdx).toLowerCase().trim();
-      const value = lines[i].slice(colonIdx + 1).trim();
-      headers.set(key, value);
-    }
-  }
-
-  return {
-    complete: true,
-    method,
-    path,
-    headers,
-    headerEndIndex: headerEnd + 4
-  };
-}
-
-function isWebSocketUpgrade(headers: Map<string, string>): boolean {
-  const upgrade = headers.get("upgrade");
-  const connection = headers.get("connection");
-  return upgrade?.toLowerCase() === "websocket" &&
-         (connection?.toLowerCase().includes("upgrade") ?? false);
+/** Validate Host header to prevent DNS rebinding attacks. */
+function isAllowedHost(host: string | null): boolean {
+  if (!host) return false;
+  const hostname = host.split(":")[0];
+  if (hostname === "localhost" || hostname.endsWith(".localhost")) return true;
+  if (hostname === "127.0.0.1" || hostname === "::1") return true;
+  if (!hostname.includes(".")) return true; // bare hostnames from PAC
+  return false;
 }
 
 // Dashboard HTML generator
@@ -133,20 +95,235 @@ Connection: close\r
   return html;
 }
 
-/** Write data to socket with backpressure handling, then close. */
-function writeAllAndEnd(socket: Socket<SocketData>, data: Uint8Array) {
-  const written = socket.write(data);
-  if (written < data.byteLength) {
-    // Couldn't write everything — stash remainder for drain handler
-    socket.data.pendingWrite = data.subarray(written);
-    socket.data.endAfterFlush = true;
-  } else {
-    socket.end();
-  }
+// ---- Internal TLS servers for HTTPS MITM (B4: Bun.serve per hostname) ----
+
+const HOP_BY_HOP_TLS = [
+  "connection",
+  "keep-alive",
+  "transfer-encoding",
+  "te",
+  "trailer",
+  "upgrade",
+];
+
+type TlsWsData = {
+  hostname: string;
+  targetPort: number;
+  backendWs: WebSocket | null;
+  backendReady: boolean;
+  pendingMessages: (string | ArrayBuffer | Uint8Array)[];
+};
+
+const tlsServers = new Map<string, { port: number; server: Server }>();
+
+async function getOrCreateTlsListener(
+  hostname: string
+): Promise<number | null> {
+  const existing = tlsServers.get(hostname);
+  if (existing) return existing.port;
+
+  const certPair = getCert(hostname);
+  if (!certPair) return null;
+
+  const tlsServer = Bun.serve<TlsWsData>({
+    hostname: "127.0.0.1",
+    port: 0,
+    tls: {
+      cert: certPair.cert,
+      key: certPair.key,
+    },
+
+    async fetch(req, server) {
+      const url = new URL(req.url);
+
+      // Look up backend port
+      const mapping = await getMapping();
+      const targetPort = mapping.get(hostname);
+
+      // Self-referential or unknown — serve dashboard / PAC
+      if (!targetPort || targetPort === listener.port) {
+        if (!targetPort) {
+          return new Response("Bad Gateway", { status: 502 });
+        }
+        if (url.pathname === "/proxy.pac") {
+          const pac = `function FindProxyForURL(url, host) {\n  if (host.indexOf(".") === -1 && host !== "localhost") {\n    return "PROXY " + host + ".localhost:${listener.port}; DIRECT";\n  }\n  return "DIRECT";\n}\n`;
+          return new Response(pac, {
+            headers: {
+              "content-type": "application/x-ns-proxy-autoconfig",
+            },
+          });
+        }
+        // Dashboard
+        const { scanServers } = await import("./scan");
+        const servers = await scanServers();
+        let html = `<!DOCTYPE html>
+<html>
+<head>
+  <title>localhome</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+    h1 { color: #333; }
+    .server { margin: 8px 0; }
+    .server a { color: #0066cc; font-size: 1.1em; }
+    .empty { color: #999; font-style: italic; }
+    code { background: #e8e8e8; padding: 2px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>localhome</h1>
+`;
+        if (servers.length === 0) {
+          html += `
+  <p class="empty">No services found.</p>
+  <p>Start a server with: <code>NAME=myapp bun run server.ts</code></p>
+`;
+        } else {
+          for (const s of servers) {
+            html += `  <div class="server"><a href="http://${s.name}/">${s.name}/</a></div>\n`;
+          }
+        }
+        html += `\n</body>\n</html>`;
+        return new Response(html, {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      }
+
+      // WebSocket upgrade
+      if (
+        req.headers.get("upgrade")?.toLowerCase() === "websocket" &&
+        req.headers.get("connection")?.toLowerCase()?.includes("upgrade")
+      ) {
+        const upgraded = server.upgrade<TlsWsData>(req, {
+          data: {
+            hostname,
+            targetPort,
+            backendWs: null,
+            backendReady: false,
+            pendingMessages: [],
+          },
+        });
+        if (upgraded) return undefined;
+        return new Response("WebSocket upgrade failed", { status: 500 });
+      }
+
+      // HTTP proxy via fetch()
+      const backendUrl = `http://localhost:${targetPort}${url.pathname}${url.search}`;
+      const fetchHeaders = new Headers();
+      for (const [key, value] of req.headers) {
+        if (!HOP_BY_HOP_TLS.includes(key.toLowerCase())) {
+          fetchHeaders.set(key, value);
+        }
+      }
+      // Strip conditional headers to avoid 304 loops
+      fetchHeaders.delete("if-none-match");
+      fetchHeaders.delete("if-modified-since");
+      // Rewrite Host for backend
+      fetchHeaders.set("host", `localhost:${targetPort}`);
+
+      try {
+        const resp = await fetch(backendUrl, {
+          method: req.method,
+          headers: fetchHeaders,
+          body:
+            req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
+          redirect: "manual",
+        });
+
+        // Build response, stripping content-encoding (fetch auto-decompresses)
+        const respHeaders = new Headers();
+        for (const [key, value] of resp.headers) {
+          if (
+            !["content-encoding", "transfer-encoding", "content-length"].includes(
+              key.toLowerCase()
+            )
+          ) {
+            respHeaders.set(key, value);
+          }
+        }
+
+        return new Response(await resp.arrayBuffer(), {
+          status: resp.status,
+          statusText: resp.statusText,
+          headers: respHeaders,
+        });
+      } catch (e) {
+        return new Response(`Proxy error: ${e}`, { status: 502 });
+      }
+    },
+
+    websocket: {
+      open(ws) {
+        const { targetPort } = ws.data;
+        const backendUrl = `ws://localhost:${targetPort}/`;
+        const backendWs = new WebSocket(backendUrl, {
+          headers: {
+            host: `localhost:${targetPort}`,
+            origin: `http://localhost:${targetPort}`,
+          },
+        } as any);
+
+        ws.data.backendWs = backendWs;
+
+        backendWs.addEventListener("open", () => {
+          ws.data.backendReady = true;
+          // Flush any messages that arrived before backend was ready
+          for (const msg of ws.data.pendingMessages) {
+            backendWs.send(msg);
+          }
+          ws.data.pendingMessages = [];
+        });
+
+        backendWs.addEventListener("message", (ev) => {
+          try {
+            if (typeof ev.data === "string") {
+              ws.sendText(ev.data);
+            } else {
+              ws.sendBinary(
+                ev.data instanceof ArrayBuffer
+                  ? new Uint8Array(ev.data)
+                  : ev.data
+              );
+            }
+          } catch {}
+        });
+
+        backendWs.addEventListener("close", () => {
+          try {
+            ws.close();
+          } catch {}
+        });
+      },
+
+      message(ws, message) {
+        if (!ws.data.backendReady) {
+          ws.data.pendingMessages.push(message);
+          return;
+        }
+        const backendWs = ws.data.backendWs;
+        if (backendWs) backendWs.send(message);
+      },
+
+      close(ws) {
+        try {
+          ws.data.backendWs?.close();
+        } catch {}
+      },
+    },
+  });
+
+  const port = tlsServer.port;
+  tlsServers.set(hostname, { port, server: tlsServer });
+  console.log(`[tls] Created Bun.serve TLS for ${hostname} on port ${port}`);
+  return port;
 }
 
+// ---- Main listener ----
+
+// Load CA before starting (non-blocking — MITM just stays disabled if no CA)
+await loadCA();
+
 const listener = Bun.listen<SocketData>({
-  hostname: "0.0.0.0",
+  hostname: process.env.BIND_HOST || "127.0.0.1",
   port: PORT,
 
   socket: {
@@ -174,7 +351,9 @@ const listener = Bun.listen<SocketData>({
         if (socketData.backend.data.rewriteHost) {
           const newHost = socketData.backend.data.rewriteHost;
           socketData.backend.data.rewriteHost = undefined;
-          const str = Buffer.isBuffer(data) ? data.toString("utf8") : new TextDecoder().decode(data);
+          const str = Buffer.isBuffer(data)
+            ? data.toString("utf8")
+            : new TextDecoder().decode(data);
           const rewritten = str
             .replace(/^Host: .+$/m, `Host: ${newHost}`)
             .replace(/^Origin: .+$/m, `Origin: http://${newHost}`);
@@ -202,60 +381,105 @@ const listener = Bun.listen<SocketData>({
 
         // Handle CONNECT tunnel (browsers use this for WebSocket/HTTPS through forward proxy)
         if (method === "CONNECT") {
-          const connectHost = path!.split(":")[0]; // "mux" from "mux:80"
+          const [connectHost, connectPortStr] = path!.split(":");
+          const connectPort = parseInt(connectPortStr || "80", 10);
 
           const mapping = await getMapping();
           const targetPort = mapping.get(connectHost);
 
-          if (!targetPort || targetPort === listener.port) {
-            // Unknown or self-referential — close so browser falls back to DIRECT
+          if (!targetPort) {
+            socket.end();
+            return;
+          }
+
+          // Self-referential: allow through for HTTPS MITM (TLS listener
+          // serves dashboard), but close for HTTP (browser falls back to DIRECT)
+          if (
+            targetPort === listener.port &&
+            !(connectPort === 443 && isMitmAvailable())
+          ) {
             socket.end();
             return;
           }
 
           socketData.subdomain = connectHost;
           socketData.targetPort = targetPort;
-          console.log(`[tcp] CONNECT tunnel ${connectHost} -> :${targetPort}`);
+
+          // HTTPS MITM: intercept TLS, decrypt, and proxy to plain HTTP backend
+          if (connectPort === 443 && isMitmAvailable()) {
+            console.log(
+              `[tcp] CONNECT MITM ${connectHost}:443 -> :${targetPort}`
+            );
+
+            const tlsPort = await getOrCreateTlsListener(connectHost);
+            if (!tlsPort) {
+              socket.end();
+              return;
+            }
+
+            try {
+              const bridge = await Bun.connect<BackendData>({
+                hostname: "127.0.0.1",
+                port: tlsPort,
+                socket: makeBackendSocketHandlers(socket, {
+                  label: `MITM bridge ${connectHost}`,
+                  onOpen() {
+                    socket.write(
+                      "HTTP/1.1 200 Connection Established\r\n\r\n"
+                    );
+                  },
+                }),
+              });
+
+              socketData.backend = bridge;
+            } catch (e) {
+              console.log(
+                `[tcp] MITM bridge failed for ${connectHost}: ${e}`
+              );
+              socket.write(
+                "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
+              );
+              socket.end();
+            }
+            return;
+          }
+
+          // Port 80 (or MITM not available) — raw TCP pipe to backend
+          console.log(
+            `[tcp] CONNECT tunnel ${connectHost} -> :${targetPort}`
+          );
 
           try {
             const backend = await Bun.connect<BackendData>({
               hostname: "localhost",
               port: targetPort,
-              socket: {
-                open(backendSocket) {
-                  backendSocket.data = {
-                    client: socket,
-                    rewriteHost: `localhost:${targetPort}`,
-                  };
-                  // Tell client the tunnel is ready — browser sends real request next
-                  socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+              socket: makeBackendSocketHandlers(socket, {
+                rewriteHost: `localhost:${targetPort}`,
+                onOpen() {
+                  socket.write(
+                    "HTTP/1.1 200 Connection Established\r\n\r\n"
+                  );
                 },
-                data(backendSocket, backendData) {
-                  try {
-                    backendSocket.data.client.write(backendData);
-                  } catch (e) {
-                    backendSocket.end();
-                  }
-                },
-                close(backendSocket) {
-                  try { backendSocket.data.client.end(); } catch (e) {}
-                },
-                error(backendSocket, error) {
-                  console.log(`[tcp] CONNECT backend error for ${connectHost}: ${error.message}`);
-                  try { backendSocket.data.client.end(); } catch (e) {}
-                },
-                end(backendSocket) {
-                  try { backendSocket.data.client.end(); } catch (e) {}
-                },
-              },
+              }),
             });
 
             socketData.backend = backend;
           } catch (e) {
             console.log(`[tcp] CONNECT failed for ${connectHost}: ${e}`);
-            socket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+            socket.write(
+              "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
+            );
             socket.end();
           }
+          return;
+        }
+
+        // Host header validation (skip for CONNECT — no Host header)
+        if (!isAllowedHost(socketData.host)) {
+          socket.write(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nForbidden: invalid Host header\n"
+          );
+          socket.end();
           return;
         }
 
@@ -265,18 +489,20 @@ const listener = Bun.listen<SocketData>({
 
         if (path!.startsWith("http://") || path!.startsWith("https://")) {
           const targetUrl = new URL(path!);
-          proxyTarget = targetUrl.hostname;  // e.g. "mux"
-          actualPath = targetUrl.pathname + targetUrl.search;  // e.g. "/somepath?q=1"
+          proxyTarget = targetUrl.hostname; // e.g. "mux"
+          actualPath = targetUrl.pathname + targetUrl.search; // e.g. "/somepath?q=1"
         }
 
-        socketData.subdomain = proxyTarget ?? extractSubdomain(socketData.host);
+        socketData.subdomain =
+          proxyTarget ?? extractSubdomain(socketData.host);
 
         // Determine if this is a dashboard request
         let isDashboard = !socketData.subdomain;
 
         if (!isDashboard) {
           const mapping = await getMapping();
-          socketData.targetPort = mapping.get(socketData.subdomain!) || null;
+          socketData.targetPort =
+            mapping.get(socketData.subdomain!) || null;
           // Self-referential: target resolves to our own port
           if (socketData.targetPort === listener.port) {
             isDashboard = true;
@@ -303,140 +529,58 @@ const listener = Bun.listen<SocketData>({
             socket.end();
             return;
           }
-          socket.write(`HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNo server found for "${socketData.subdomain}.localhost"\n`);
+          socket.write(
+            `HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNo server found for "${socketData.subdomain}.localhost"\n`
+          );
+          socket.end();
+          return;
+        }
+
+        // Redirect HTTP → HTTPS for forward proxy when MITM is available
+        if (proxyTarget && isMitmAvailable() && !socketData.isUpgrade) {
+          socket.write(
+            `HTTP/1.1 302 Found\r\nLocation: https://${proxyTarget}${actualPath}\r\nConnection: close\r\n\r\n`
+          );
           socket.end();
           return;
         }
 
         if (socketData.isUpgrade) {
-          // WebSocket upgrade - do TCP-level proxying
-          console.log(`[tcp] WebSocket upgrade ${socketData.subdomain} -> :${socketData.targetPort}`);
-
-          // Rewrite request for backend: absolute URI → relative path, fix Host + Origin
+          // WebSocket upgrade — rewrite Host + Origin for backend
+          let rawStr = socketData.buffer.toString("utf8");
           if (proxyTarget) {
-            let rawStr = socketData.buffer.toString("utf8");
             rawStr = rawStr.replace(
               `${method} ${path} `,
               `${method} ${actualPath} `
             );
-            rawStr = rawStr.replace(
-              /^Host: .+$/m,
-              `Host: localhost:${socketData.targetPort}`
-            );
-            rawStr = rawStr.replace(
-              /^Origin: .+$/m,
-              `Origin: http://localhost:${socketData.targetPort}`
-            );
-            socketData.buffer = Buffer.from(rawStr);
           }
+          rawStr = rawStr.replace(
+            /^Host: .+$/m,
+            `Host: localhost:${socketData.targetPort}`
+          );
+          rawStr = rawStr.replace(
+            /^Origin: .+$/m,
+            `Origin: http://localhost:${socketData.targetPort}`
+          );
+          socketData.buffer = Buffer.from(rawStr);
 
-          try {
-            const backend = await Bun.connect<BackendData>({
-              hostname: "localhost",
-              port: socketData.targetPort,
-              socket: {
-                open(backendSocket) {
-                  backendSocket.data = { client: socket };
-                  // Forward the original request including headers
-                  backendSocket.write(socketData.buffer);
-                },
-                data(backendSocket, backendData) {
-                  // Forward backend -> client
-                  try {
-                    backendSocket.data.client.write(backendData);
-                  } catch (e) {
-                    // Client disconnected
-                    backendSocket.end();
-                  }
-                },
-                close(backendSocket) {
-                  console.log(`[tcp] Backend closed for ${socketData.subdomain}`);
-                  try {
-                    backendSocket.data.client.end();
-                  } catch (e) {
-                    // Already closed
-                  }
-                },
-                error(backendSocket, error) {
-                  console.log(`[tcp] Backend error for ${socketData.subdomain}: ${error.message}`);
-                  try {
-                    backendSocket.data.client.end();
-                  } catch (e) {
-                    // Already closed
-                  }
-                },
-                end(backendSocket) {
-                  try {
-                    backendSocket.data.client.end();
-                  } catch (e) {
-                    // Already closed
-                  }
-                },
-              },
-            });
-
-            socketData.backend = backend;
-          } catch (e) {
-            console.log(`[tcp] Failed to connect to backend: ${e}`);
-            socket.write(`HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nFailed to connect to backend\n`);
-            socket.end();
-          }
+          const backend = await proxyWebSocket(socket, {
+            targetPort: socketData.targetPort,
+            subdomain: socketData.subdomain!,
+            rawBuffer: socketData.buffer,
+          });
+          if (backend) socketData.backend = backend;
         } else {
-          // Regular HTTP - use fetch() for proxying
-          const bodyStart = headerEndIndex!;
-          const body = socketData.buffer.slice(bodyStart);
-
-          // Reconstruct the URL
-          const url = `http://localhost:${socketData.targetPort}${actualPath}`;
-
-          // Build headers for fetch
-          const fetchHeaders = new Headers();
-          for (const [key, value] of headers!) {
-            // Skip hop-by-hop headers
-            if (!["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade"].includes(key)) {
-              fetchHeaders.set(key, value);
-            }
-          }
-          // Strip conditional headers to avoid 304 loops
-          fetchHeaders.delete("if-none-match");
-          fetchHeaders.delete("if-modified-since");
-          // Rewrite Host header for proxy requests so backends accept it
-          if (proxyTarget) {
-            fetchHeaders.set("host", `localhost:${socketData.targetPort}`);
-          }
-
-          try {
-            const response = await fetch(url, {
-              method: method,
-              headers: fetchHeaders,
-              body: method !== "GET" && method !== "HEAD" && body.length > 0 ? body : undefined,
-              redirect: "manual",
-            });
-
-            // Build response headers
-            let responseText = `HTTP/1.1 ${response.status} ${response.statusText}\r\n`;
-            for (const [key, value] of response.headers) {
-              // Skip hop-by-hop headers and content-length (fetch decompresses
-              // gzip/br bodies so the original content-length is wrong;
-              // Connection: close signals end-of-body instead)
-              if (!["connection", "keep-alive", "transfer-encoding", "content-length", "content-encoding"].includes(key.toLowerCase())) {
-                responseText += `${key}: ${value}\r\n`;
-              }
-            }
-            responseText += "Connection: close\r\n\r\n";
-
-            // Combine headers + body into one buffer so writeAllAndEnd
-            // can handle backpressure for the entire response
-            const headerBytes = new TextEncoder().encode(responseText);
-            const bodyBytes = new Uint8Array(await response.arrayBuffer());
-            const fullResp = new Uint8Array(headerBytes.byteLength + bodyBytes.byteLength);
-            fullResp.set(headerBytes, 0);
-            fullResp.set(bodyBytes, headerBytes.byteLength);
-            writeAllAndEnd(socket, fullResp);
-          } catch (e) {
-            socket.write(`HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nProxy error: ${e}\n`);
-            socket.end();
-          }
+          // Regular HTTP — use fetch() for proxying
+          const body = socketData.buffer.slice(headerEndIndex!);
+          await proxyHttpRequest(socket, {
+            method: method!,
+            path: actualPath,
+            targetPort: socketData.targetPort,
+            headers: headers!,
+            body,
+            rewriteHost: !!proxyTarget,
+          });
         }
       }
     },
@@ -460,9 +604,7 @@ const listener = Bun.listen<SocketData>({
         console.log(`[tcp] Client closed for ${socketData.subdomain}`);
         try {
           socketData.backend.end();
-        } catch (e) {
-          // Already closed
-        }
+        } catch (e) {}
       }
     },
 
@@ -472,9 +614,7 @@ const listener = Bun.listen<SocketData>({
       if (socketData?.backend) {
         try {
           socketData.backend.end();
-        } catch (e) {
-          // Already closed
-        }
+        } catch (e) {}
       }
     },
   },
