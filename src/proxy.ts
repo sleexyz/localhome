@@ -102,7 +102,20 @@ export function makeBackendSocketHandlers(
     },
     data(backendSocket: Socket<BackendData>, data: Buffer) {
       try {
-        backendSocket.data.client.write(data);
+        const client = backendSocket.data.client;
+        if (client.data.pendingWrite) {
+          // Already have pending data — just append, wait for drain
+          client.data.pendingWrite = Buffer.concat([
+            client.data.pendingWrite,
+            data,
+          ]);
+          return;
+        }
+        const written = client.write(data);
+        if (written < data.byteLength) {
+          // Backpressure: buffer remaining bytes for the client's drain handler
+          client.data.pendingWrite = Buffer.from(data.subarray(written));
+        }
       } catch (e) {
         backendSocket.end();
       }

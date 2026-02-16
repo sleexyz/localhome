@@ -265,46 +265,8 @@ async function getOrCreateTlsListener(
           }
         }
 
-        // Wrap response body: if browser disconnects mid-stream, drain
-        // the upstream instead of aborting (which sends RST to the backend)
-        const upstream = resp.body;
-        if (!upstream) {
-          return new Response(null, {
-            status: resp.status,
-            statusText: resp.statusText,
-            headers: respHeaders,
-          });
-        }
-
-        const reader = upstream.getReader();
-        const body = new ReadableStream({
-          async pull(controller) {
-            try {
-              const { done, value } = await reader.read();
-              if (done) {
-                controller.close();
-                return;
-              }
-              controller.enqueue(value);
-            } catch {
-              controller.close();
-            }
-          },
-          cancel() {
-            // Browser disconnected — drain the rest of the upstream
-            // so the backend connection closes with FIN, not RST
-            (async () => {
-              try {
-                while (true) {
-                  const { done } = await reader.read();
-                  if (done) break;
-                }
-              } catch {}
-            })();
-          },
-        });
-
-        return new Response(body, {
+        // Stream the response body through to the client
+        return new Response(resp.body, {
           status: resp.status,
           statusText: resp.statusText,
           headers: respHeaders,
