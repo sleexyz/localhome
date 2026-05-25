@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
-import { connect, type Socket } from "net";
+import { connect, createServer, type Socket } from "net";
 import { connect as tlsConnect } from "tls";
 import { randomBytes } from "crypto";
 import { mkdirSync, writeFileSync, rmSync } from "fs";
@@ -10,8 +10,10 @@ import forge from "node-forge";
 
 let daemon: ChildProcess;
 let backend: ChildProcess;
+let unregBackend: ChildProcess; // listens with no NAME → shows in "Unregistered"
 let daemonPort: number;
 let backendPort: number;
+let unregPort: number;
 
 // Test CA for HTTPS MITM tests
 let testCaDir: string;
@@ -57,6 +59,21 @@ function spawnAndGetPort(
       clearTimeout(timeout);
       reject(new Error(`Process exited with code ${code} before LISTENING. Output: ${buf}`));
     });
+  });
+}
+
+/** Find a free TCP port below the ephemeral range (so it survives scan.ts's ephemeral filter). */
+function freeNonEphemeralPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    let attempts = 0;
+    const tryOne = () => {
+      if (attempts++ > 30) return reject(new Error("no free port found"));
+      const p = 20000 + Math.floor(Math.random() * 20000); // 20000–39999
+      const srv = createServer();
+      srv.once("error", () => tryOne());
+      srv.listen(p, "127.0.0.1", () => srv.close(() => resolve(p)));
+    };
+    tryOne();
   });
 }
 
@@ -312,15 +329,24 @@ beforeAll(async () => {
   writeFileSync(join(testCaDir, "rootCA.pem"), caCertPem);
   writeFileSync(join(testCaDir, "rootCA-key.pem"), caKeyPem);
 
-  const [d, b] = await Promise.all([
+  unregPort = await freeNonEphemeralPort();
+
+  const [d, b, u] = await Promise.all([
     spawnAndGetPort(bun, ["src/index.ts"], {
       PORT: "0",
       NAME: "_testhome",
       MKCERT_CA_ROOT: testCaDir,
+      TAILSCALE_HOSTNAME: "mybox",
+      LOCALHOME_PROBE: "0", // don't fire probes at the real machine's services during tests
     }),
     spawnAndGetPort(bun, ["src/test-backend.ts"], {
       PORT: "0",
       NAME: "testapp",
+    }),
+    // Backend with NO NAME → should surface in the dashboard's "Unregistered" section
+    spawnAndGetPort(bun, ["src/test-backend.ts"], {
+      PORT: String(unregPort),
+      NAME: "",
     }),
   ]);
 
@@ -328,11 +354,12 @@ beforeAll(async () => {
   daemonPort = d.port;
   backend = b.proc;
   backendPort = b.port;
+  unregBackend = u.proc;
 
 }, 15_000);
 
 afterAll(() => {
-  for (const pid of [daemon?.pid, backend?.pid]) {
+  for (const pid of [daemon?.pid, backend?.pid, unregBackend?.pid]) {
     if (pid) try { process.kill(pid, "SIGKILL"); } catch {}
   }
   try { rmSync(testCaDir, { recursive: true }); } catch {}
@@ -591,6 +618,27 @@ describe("dashboard & PAC", () => {
     );
     expect(parseStatusCode(resp)).toBe(200);
     expect(parseBody(resp)).toContain("localhome");
+  });
+
+  test("dashboard lists unregistered services with metadata", async () => {
+    // Poll until the unregistered backend shows up (scan cache + lsof lag).
+    const resp = await retryRequest(
+      () =>
+        tcpRequest(
+          daemonPort,
+          `GET / HTTP/1.1\r\nHost: localhost:${daemonPort}\r\n\r\n`
+        ),
+      (r) => parseBody(r).includes(`:${unregPort}`)
+    );
+    const body = parseBody(resp);
+    expect(body).toContain("Unregistered");
+    // The no-NAME backend appears with its port and pid as distinguishing metadata.
+    expect(body).toContain(`:${unregPort}`);
+    expect(body).toContain(`pid ${unregBackend.pid}`);
+    // It runs from the repo dir (under $HOME) so it's classified as a dev server.
+    expect(body).toContain("Likely dev servers");
+    // No NAME to route by, so the row links straight to the port on loopback.
+    expect(body).toContain(`href="http://localhost:${unregPort}/"`);
   });
 
   test("_testhome.localhost serves dashboard (reverse proxy, self-discovery)", async () => {
@@ -954,4 +1002,94 @@ describe("HTTPS MITM", () => {
 
     tlsSock.destroy();
   }, 15_000);
+});
+
+describe("tailscale MagicDNS", () => {
+  test("HTTP — routes by tailscale subdomain", async () => {
+    const resp = await retryRequest(
+      () =>
+        tcpRequest(
+          daemonPort,
+          `GET / HTTP/1.1\r\nHost: testapp.mybox:${daemonPort}\r\n\r\n`
+        ),
+      (r) => parseStatusCode(r) === 200
+    );
+
+    expect(parseStatusCode(resp)).toBe(200);
+    const body = JSON.parse(parseBody(resp));
+    expect(body.name).toBe("testapp");
+    expect(body.path).toBe("/");
+  });
+
+  test("dashboard via tailscale hostname", async () => {
+    const resp = await tcpRequest(
+      daemonPort,
+      `GET / HTTP/1.1\r\nHost: mybox:${daemonPort}\r\n\r\n`
+    );
+    expect(parseStatusCode(resp)).toBe(200);
+    expect(parseBody(resp)).toContain("localhome");
+  });
+
+  test("dashboard links use tailscale hostname", async () => {
+    const resp = await retryRequest(
+      () =>
+        tcpRequest(
+          daemonPort,
+          `GET / HTTP/1.1\r\nHost: mybox:${daemonPort}\r\n\r\n`
+        ),
+      (r) => parseBody(r).includes("testapp")
+    );
+    const body = parseBody(resp);
+    expect(body).toContain(`testapp.mybox:${daemonPort}`);
+  });
+
+  test("unknown tailscale subdomain returns 404", async () => {
+    const resp = await tcpRequest(
+      daemonPort,
+      `GET / HTTP/1.1\r\nHost: nonexistent.mybox:${daemonPort}\r\n\r\n`
+    );
+    expect(parseStatusCode(resp)).toBe(404);
+  });
+
+  test("WebSocket — upgrade via tailscale subdomain", async () => {
+    const sock = await tcpConnect(daemonPort);
+
+    sock.write(wsUpgradeRequest(`testapp.mybox:${daemonPort}`));
+
+    const upgradeResp = await collectUntil(sock, (buf) =>
+      buf.toString("utf8").includes("\r\n\r\n")
+    );
+    expect(parseStatusCode(upgradeResp)).toBe(101);
+
+    const testMsg = "hello tailscale";
+    sock.write(encodeWsFrame(testMsg));
+
+    const frameData = await collectUntil(
+      sock,
+      (buf) => {
+        const frame = decodeWsFrame(buf);
+        return frame !== null && frame.payload.length > 0;
+      },
+      3000
+    );
+
+    const decoded = decodeWsFrame(frameData);
+    expect(decoded).not.toBeNull();
+    expect(decoded!.payload).toBe(testMsg);
+
+    sock.destroy();
+  });
+
+  test("self-referential tailscale subdomain shows dashboard", async () => {
+    const resp = await retryRequest(
+      () =>
+        tcpRequest(
+          daemonPort,
+          `GET / HTTP/1.1\r\nHost: _testhome.mybox:${daemonPort}\r\n\r\n`
+        ),
+      (r) => parseStatusCode(r) === 200
+    );
+    expect(parseStatusCode(resp)).toBe(200);
+    expect(parseBody(resp)).toContain("localhome");
+  });
 });
