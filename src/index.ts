@@ -44,14 +44,45 @@ const PROBE = process.env.LOCALHOME_PROBE !== "0";
 let unregCache: UnregisteredService[] = [];
 let unregLastScan = 0;
 
-/** Cached unregistered-service scan (separate from the routing cache; dashboard-only). */
+/** Cached unregistered-service scan (separate from the routing cache; dashboard-only).
+ *  The daemon's own PID is filtered out — it's not a service you'd open. */
 async function getUnregistered(): Promise<UnregisteredService[]> {
   const now = Date.now();
   if (now - unregLastScan > CACHE_TTL_MS) {
-    unregCache = await scanUnregistered({ probe: PROBE });
+    const all = await scanUnregistered({ probe: PROBE });
+    unregCache = all.filter((s) => s.pid !== process.pid);
     unregLastScan = now;
   }
   return unregCache;
+}
+
+// Ephemeral <project>-<role> routes for unregistered dev services. Cheap scan
+// (no probe), cached separately from the dashboard's probed scan.
+let genMappingCache: Map<string, number> = new Map();
+let genLastScan = 0;
+
+async function getGeneratedMapping(): Promise<Map<string, number>> {
+  const now = Date.now();
+  if (now - genLastScan > CACHE_TTL_MS) {
+    const m = new Map<string, number>();
+    for (const s of await scanUnregistered({ probe: false })) {
+      if (s.name && s.pid !== process.pid) m.set(s.name, s.primaryPort);
+    }
+    genMappingCache = m;
+    genLastScan = now;
+  }
+  return genMappingCache;
+}
+
+/**
+ * Resolve a host label to a backend port. Registered NAME wins and resolves
+ * without ever scanning unregistered services — so the hot path is unchanged
+ * and only an unknown name pays for generated-name lookup.
+ */
+async function resolvePort(name: string): Promise<number | undefined> {
+  const reg = (await getMapping()).get(name);
+  if (reg !== undefined) return reg;
+  return (await getGeneratedMapping()).get(name);
 }
 
 /** Auto-detect tailscale machine name via CLI. */
@@ -143,42 +174,71 @@ function formatUptime(etime: string): string {
   return `up ${s}s`;
 }
 
-/** Render one unregistered service as an info card linking to its port(s). */
-function renderUnregRow(s: UnregisteredService, home: string): string {
+/**
+ * Build the link for a routable service name from the dashboard's request host:
+ *   - reached via the Tailscale hostname → qualified `name.<tailscale>:<port>/`
+ *     so it routes back to this machine over MagicDNS from a remote browser.
+ *   - otherwise → bare `name/`, routed by the extension regardless of how the
+ *     dashboard was reached (localhost, *.localhost, or a bare host like home/).
+ */
+function serviceLinker(requestHost: string | null): (name: string) => string {
+  const [hostname, portStr] = (requestHost || "").split(":");
+  const port = portStr || String(PORT);
+  if (
+    tailscaleHostname &&
+    hostname &&
+    (hostname === tailscaleHostname || hostname.endsWith(`.${tailscaleHostname}`))
+  ) {
+    return (name) => `http://${esc(name)}.${tailscaleHostname}:${port}/`;
+  }
+  return (name) => `http://${esc(name)}/`;
+}
+
+/** Render one unregistered service: a named dev service links to its routable
+ *  name (bare locally, tailscale-qualified remotely); port chips link to localhost. */
+function renderUnregRow(
+  s: UnregisteredService,
+  home: string,
+  link: (name: string) => string
+): string {
   const cwd =
     s.cwd && home && s.cwd.startsWith(home) ? `~${s.cwd.slice(home.length)}` : s.cwd;
   const cmd = truncMiddle(s.command, 110);
-  // No NAME to route by, so link straight to the port on loopback.
-  const href = (p: number) => `http://localhost:${p}/`;
-  const ports = s.ports.map((p) => `<a href="${href(p)}">:${p}</a>`).join(", ");
+  const direct = (p: number) => `http://localhost:${p}/`;
+  const ports = s.ports.map((p) => `<a href="${direct(p)}">:${p}</a>`).join(", ");
   const icon = s.favicon
     ? `<img class="fav" src="${s.favicon}" alt="">`
     : `<span class="fav dot"></span>`;
-  const titleText = s.title || s.process || "(unknown)";
+  const probed = s.title || s.process || "";
+  // Named → routable name link (bare locally, tailscale-qualified remotely).
+  // Unnamed → straight to the port on loopback.
+  const primaryHref = s.name ? link(s.name) : direct(s.primaryPort);
+  const headText = s.name ? `${esc(s.name)}/` : esc(probed || "(unknown)");
+  const titleLink = `<a class="utitle" href="${primaryHref}">${headText}</a>`;
+  // When we show the generated name, keep the probed title as a muted alias.
+  const alias = s.name && probed ? ` <span class="alias">${esc(probed)}</span>` : "";
   const badge =
     s.scope !== "local" ? ` <span class="badge ${s.scope}">${s.scope}</span>` : "";
   const up = s.etime ? ` <span class="up">${esc(formatUptime(s.etime))}</span>` : "";
   return `    <div class="unreg">
-      <a class="fav-link" href="${href(s.primaryPort)}">${icon}</a>
+      <a class="fav-link" href="${primaryHref}">${icon}</a>
       <div class="unreg-body">
-        <div class="unreg-head"><a class="utitle" href="${href(s.primaryPort)}">${esc(titleText)}</a>${badge}${up}</div>
+        <div class="unreg-head">${titleLink}${alias}${badge}${up}</div>
         ${cmd ? `<div class="cmd">${esc(cmd)}</div>` : ""}
         <div class="meta">${cwd ? `<span class="cwd">${esc(cwd)}</span> · ` : ""}<span class="ports">${ports}</span> · <span class="pid">pid ${s.pid}</span></div>
       </div>
     </div>\n`;
 }
 
-// Dashboard HTML generator — uses request Host to build service links
+// Dashboard HTML generator. Service links adapt to the request host: bare
+// `name/` locally (extension-routed), tailscale-qualified for remote access.
 async function renderDashboardHtml(requestHost: string | null): Promise<string> {
   const [servers, unregistered] = await Promise.all([
     scanServers(),
     getUnregistered(),
   ]);
   const home = process.env.HOME || "";
-
-  const parts = (requestHost || `localhost:${PORT}`).split(":");
-  const baseName = parts[0];
-  const port = parts[1] || String(PORT);
+  const link = serviceLinker(requestHost);
 
   let html = `<!DOCTYPE html>
 <html>
@@ -202,6 +262,7 @@ async function renderDashboardHtml(requestHost: string | null): Promise<string> 
     .unreg-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .utitle { font-weight: 600; color: #0066cc; text-decoration: none; }
     .utitle:hover { text-decoration: underline; }
+    .alias { color: #888; font-weight: 400; font-size: 0.9em; }
     .cmd { font-family: ui-monospace, monospace; font-size: 0.8em; color: #555; word-break: break-all; margin: 2px 0; }
     .meta { font-size: 0.82em; color: #888; }
     .meta .cwd { color: #0a7d28; }
@@ -228,7 +289,7 @@ async function renderDashboardHtml(requestHost: string | null): Promise<string> 
     html += `  <p class="empty">No registered services. Start one with <code>NAME=myapp bun run server.ts</code></p>\n`;
   } else {
     for (const server of servers) {
-      html += `  <div class="server"><a href="http://${server.name}.${baseName}:${port}/">${server.name}/</a></div>\n`;
+      html += `  <div class="server"><a href="${link(server.name)}">${esc(server.name)}/</a></div>\n`;
     }
   }
 
@@ -241,13 +302,13 @@ async function renderDashboardHtml(requestHost: string | null): Promise<string> 
   } else {
     if (dev.length > 0) {
       html += `  <h3>Likely dev servers</h3>\n`;
-      for (const s of dev) html += renderUnregRow(s, home);
+      for (const s of dev) html += renderUnregRow(s, home, link);
     } else {
       html += `  <p class="empty">No unregistered dev servers.</p>\n`;
     }
     if (sys.length > 0) {
       html += `  <details class="sys"><summary>System / other (${sys.length})</summary>\n`;
-      for (const s of sys) html += renderUnregRow(s, home);
+      for (const s of sys) html += renderUnregRow(s, home, link);
       html += `  </details>\n`;
     }
   }
@@ -313,9 +374,8 @@ async function getOrCreateTlsListener(
     async fetch(req, server) {
       const url = new URL(req.url);
 
-      // Look up backend port
-      const mapping = await getMapping();
-      const targetPort = mapping.get(hostname);
+      // Look up backend port (registered NAME, then ephemeral generated name)
+      const targetPort = await resolvePort(hostname);
 
       // Self-referential or unknown — serve dashboard / PAC
       if (!targetPort || targetPort === listener.port) {
@@ -571,8 +631,7 @@ const listener = Bun.listen<SocketData>({
           const [connectHost, connectPortStr] = path!.split(":");
           const connectPort = parseInt(connectPortStr || "80", 10);
 
-          const mapping = await getMapping();
-          const targetPort = mapping.get(connectHost);
+          const targetPort = await resolvePort(connectHost);
 
           if (!targetPort) {
             socket.end();
@@ -687,9 +746,8 @@ const listener = Bun.listen<SocketData>({
         let isDashboard = !socketData.subdomain;
 
         if (!isDashboard) {
-          const mapping = await getMapping();
           socketData.targetPort =
-            mapping.get(socketData.subdomain!) || null;
+            (await resolvePort(socketData.subdomain!)) ?? null;
           // Self-referential: target resolves to our own port
           if (socketData.targetPort === listener.port) {
             isDashboard = true;

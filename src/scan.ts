@@ -199,6 +199,7 @@ export interface UnregisteredService {
   cwd: string;
   etime: string; // raw `ps` elapsed time (e.g. "01-14:59:59")
   isDev: boolean; // heuristic: cwd under $HOME and not an app bundle
+  name?: string; // ephemeral <project>-<role> route (dev services only)
   title?: string; // probed <title>
   favicon?: string; // probed favicon as a data: URI
 }
@@ -207,6 +208,88 @@ export interface UnregisteredService {
 function shortProcessName(command: string): string {
   const argv0 = command.trim().split(/\s+/)[0] || "";
   return argv0.split("/").pop() || argv0;
+}
+
+// ---- Ephemeral name generation for unregistered dev services ----
+//
+// A service with no NAME still gets a routable handle, derived purely from what
+// it is: <project>-<role>, e.g. `edging-streamlit`. No persistent state — the
+// name is recomputed from the live process list, so it exists only while the
+// service runs. The proxy reverses it by re-deriving names and matching.
+
+const INTERPRETERS = new Set([
+  "node", "nodejs", "bun", "deno", "python", "python2", "python3",
+  "ruby", "php", "perl", "sh", "bash", "zsh",
+]);
+
+/** Lowercase DNS-label slug: keep [a-z0-9], collapse the rest to hyphens, trim. */
+function slug(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+/** Basename of a script path, minus a known source extension. */
+function scriptBase(token: string): string {
+  const base = token.split("/").pop() || token;
+  return base.replace(/\.(py|js|mjs|cjs|ts|tsx|jsx|rb|php|pl|sh)$/i, "");
+}
+
+/** Drop a trailing version from an interpreter name: "python3.14" -> "python". */
+function stripVersion(name: string): string {
+  return name.replace(/[0-9][0-9.]*$/, "");
+}
+
+/**
+ * Infer a short role from a command line, seeing through interpreters:
+ *   python .venv/bin/streamlit run app.py  -> streamlit
+ *   python -m sky.server.server            -> sky
+ *   node node_modules/.bin/vite            -> vite
+ *   marimo edit notebooks/                 -> marimo
+ */
+function roleName(command: string, fallback: string): string {
+  const toks = command.trim().split(/\s+/).filter(Boolean);
+  if (toks.length === 0) return slug(fallback);
+  const arg0 = (toks[0].split("/").pop() || "").toLowerCase();
+  if (!INTERPRETERS.has(arg0) && !INTERPRETERS.has(stripVersion(arg0))) {
+    return slug(scriptBase(toks[0])) || slug(fallback);
+  }
+  // Interpreter — dig for the real entrypoint.
+  for (let j = 1; j < toks.length; j++) {
+    const t = toks[j];
+    if (t === "-m" && toks[j + 1]) return slug(toks[j + 1].split(".")[0]); // module head
+    if ((t === "run" || t === "exec") && toks[j + 1] && !toks[j + 1].startsWith("-"))
+      return slug(scriptBase(toks[j + 1]));
+    if (t.startsWith("-")) continue; // skip flags
+    return slug(scriptBase(t)); // first bare token = script/tool
+  }
+  return slug(stripVersion(arg0)); // bare interpreter
+}
+
+/** Project label = basename of the working directory. */
+function projectName(cwd: string): string {
+  return slug(cwd.split("/").filter(Boolean).pop() || "");
+}
+
+/**
+ * Assign ephemeral `<project>-<role>` names to dev services in place. Collisions
+ * (same project + role) are disambiguated with the port, which is stable per
+ * process; unique names stay clean.
+ */
+function assignNames(services: UnregisteredService[]): void {
+  const dev = services.filter((s) => s.isDev);
+  const base = new Map<UnregisteredService, string>();
+  for (const s of dev) {
+    const name = [projectName(s.cwd), roleName(s.command, s.process)]
+      .filter(Boolean)
+      .join("-");
+    if (name) base.set(s, name);
+  }
+  const counts = new Map<string, number>();
+  for (const n of base.values()) counts.set(n, (counts.get(n) || 0) + 1);
+  for (const s of dev) {
+    const b = base.get(s);
+    if (!b) continue;
+    s.name = counts.get(b)! > 1 ? `${b}-${s.primaryPort}` : b;
+  }
 }
 
 /** Batched env read for many PIDs (one `ps -Eww`). Used to detect NAME + PWD. */
@@ -423,6 +506,8 @@ export async function scanUnregistered(
       })
     );
   }
+
+  assignNames(services);
 
   // Dev servers first, then grouped by project (cwd), then by port.
   services.sort((a, b) => {

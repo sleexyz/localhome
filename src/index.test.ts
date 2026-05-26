@@ -637,8 +637,28 @@ describe("dashboard & PAC", () => {
     expect(body).toContain(`pid ${unregBackend.pid}`);
     // It runs from the repo dir (under $HOME) so it's classified as a dev server.
     expect(body).toContain("Likely dev servers");
-    // No NAME to route by, so the row links straight to the port on loopback.
+    // The port chip links straight to the port on loopback.
     expect(body).toContain(`href="http://localhost:${unregPort}/"`);
+    // It also gets an ephemeral <project>-<role> name (repo dir "localhome" +
+    // entrypoint "test-backend"), shown as the headline link to its bare name.
+    expect(body).toContain("localhome-test-backend");
+    expect(body).toContain(`href="http://localhome-test-backend/"`);
+  });
+
+  test("ephemeral generated name routes to the unregistered backend", async () => {
+    // Hitting the generated name as a vhost should proxy to the no-NAME backend,
+    // resolved with no persistent state — recomputed from the live process list.
+    const resp = await retryRequest(
+      () =>
+        tcpRequest(
+          daemonPort,
+          `GET /probe HTTP/1.1\r\nHost: localhome-test-backend.localhost:${daemonPort}\r\n\r\n`
+        ),
+      (r) => r.toString().startsWith("HTTP/1.1 200"),
+      20
+    );
+    // test-backend echoes the request path → proves we reached that backend.
+    expect(parseBody(resp)).toContain(`"path":"/probe"`);
   });
 
   test("_testhome.localhost serves dashboard (reverse proxy, self-discovery)", async () => {
