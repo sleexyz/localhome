@@ -1,4 +1,6 @@
-const PORT = 9090;
+// Must match the daemon's `port` (see Configuration in the README).
+// Bare-name requests like `app/` are proxied to `app.localhost:<PORT>`.
+const PORT = 80;
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.proxy.settings.set({

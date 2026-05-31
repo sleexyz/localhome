@@ -332,7 +332,11 @@ beforeAll(async () => {
   unregPort = await freeNonEphemeralPort();
 
   const [d, b, u] = await Promise.all([
-    spawnAndGetPort(bun, ["src/index.ts"], {
+    // --config points at a nonexistent file so the daemon ignores BOTH default
+    // config locations (~/.config/localhome/config.json and ./localhome.local.json).
+    // Tests must be hermetic: a developer's personal config (e.g. bindHost:"tailscale"
+    // or port:80) must not leak in and change the bind address out from under the suite.
+    spawnAndGetPort(bun, ["src/index.ts", "--config", join(testCaDir, "no-config.json")], {
       PORT: "0",
       NAME: "_testhome",
       MKCERT_CA_ROOT: testCaDir,
@@ -1061,6 +1065,18 @@ describe("tailscale MagicDNS", () => {
     );
     const body = parseBody(resp);
     expect(body).toContain(`testapp.mybox:${daemonPort}`);
+  });
+
+  test("dashboard links are portless when reached portlessly (port 80)", async () => {
+    // Reached on a Host with no explicit port (as on :80, e.g. http://mybox/),
+    // service links must omit the port so they work on a port-80 deployment.
+    const resp = await retryRequest(
+      () => tcpRequest(daemonPort, `GET / HTTP/1.1\r\nHost: mybox\r\n\r\n`),
+      (r) => parseBody(r).includes("testapp")
+    );
+    const body = parseBody(resp);
+    expect(body).toContain(`testapp.mybox/`);
+    expect(body).not.toContain(`testapp.mybox:`);
   });
 
   test("unknown tailscale subdomain returns 404", async () => {

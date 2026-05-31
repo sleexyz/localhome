@@ -1,6 +1,10 @@
 # dependencies
 node_modules/
 
+# local machine config (personal; never checked in)
+localhome.local.json
+launchd/*.local.plist
+
 # polo
 bashes.log
 BLOCKING.md

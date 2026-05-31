@@ -21,14 +21,20 @@ import {
 } from "./proxy";
 import type { Server, ServerWebSocket } from "bun";
 import { loadCA, isMitmAvailable, getCert } from "./certs";
+import { loadConfig } from "./config";
+import { existsSync } from "fs";
 import type { Socket } from "bun";
 
-const PORT = parseInt(process.env.PORT || "9090", 10);
+const config = loadConfig();
+const PORT = config.port;
 const CACHE_TTL_MS = 5000;
 
 let mappingCache: Map<string, number> = new Map();
 let lastScan = 0;
-let tailscaleHostname: string | null = process.env.TAILSCALE_HOSTNAME || null;
+// Routing suffix: services are reachable at <name>.<domain>. When set explicitly
+// (config/env) we use it verbatim; otherwise it's auto-detected from tailscale.
+// (Historically this was "tailscaleHostname"; TAILSCALE_HOSTNAME is still honored.)
+let domain: string | null = config.domain;
 
 async function getMapping(): Promise<Map<string, number>> {
   const now = Date.now();
@@ -39,8 +45,8 @@ async function getMapping(): Promise<Map<string, number>> {
   return mappingCache;
 }
 
-// Set LOCALHOME_PROBE=0 to skip the per-service title/favicon fetch (used in tests).
-const PROBE = process.env.LOCALHOME_PROBE !== "0";
+// Whether to do the per-service title/favicon fetch (disabled in tests via config/env).
+const PROBE = config.probe;
 let unregCache: UnregisteredService[] = [];
 let unregLastScan = 0;
 
@@ -85,10 +91,29 @@ async function resolvePort(name: string): Promise<number | undefined> {
   return (await getGeneratedMapping()).get(name);
 }
 
-/** Auto-detect tailscale machine name via CLI. */
-async function detectTailscale(): Promise<string | null> {
+/** Locate the tailscale CLI. PATH is unreliable under launchd/systemd, so we
+ *  also probe the common absolute install locations (Homebrew, Nix, the macOS
+ *  app bundle, standard Linux paths). */
+function findTailscaleBin(): string {
+  const candidates = [
+    "/opt/homebrew/bin/tailscale", // macOS Homebrew (Apple Silicon)
+    "/usr/local/bin/tailscale", // macOS Homebrew (Intel) / Linux
+    "/run/current-system/sw/bin/tailscale", // NixOS / nix-darwin
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale", // macOS app bundle
+    "/usr/bin/tailscale", // Linux package
+  ];
+  for (const p of candidates) {
+    try {
+      if (existsSync(p)) return p;
+    } catch {}
+  }
+  return "tailscale"; // last resort: rely on PATH
+}
+
+/** Auto-detect this machine's tailscale name + IP via the CLI. */
+async function detectTailscale(): Promise<{ name: string | null; ip: string | null }> {
   try {
-    const proc = Bun.spawn(["tailscale", "status", "--json"], {
+    const proc = Bun.spawn([findTailscaleBin(), "status", "--json"], {
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -96,10 +121,44 @@ async function detectTailscale(): Promise<string | null> {
     const status = JSON.parse(output);
     // DNSName is like "seans-macbook-pro.tail84601.ts.net."
     const dnsName: string | undefined = status.Self?.DNSName;
-    if (!dnsName) return null;
-    return dnsName.split(".")[0] || null;
+    const name = dnsName ? dnsName.split(".")[0] || null : null;
+    // TailscaleIPs is like ["100.73.3.108", "fd7a:115c:a1e0::..."]; prefer IPv4.
+    const ips: string[] = status.Self?.TailscaleIPs ?? [];
+    const ip = ips.find((a) => a.includes(".")) ?? ips[0] ?? null;
+    return { name, ip };
   } catch {
-    return null;
+    return { name: null, ip: null };
+  }
+}
+
+/**
+ * Resolve the configured bindHost mode into a concrete listen address.
+ *   "loopback" → 127.0.0.1
+ *   "all"      → 0.0.0.0
+ *   "tailscale"→ this machine's tailnet IP (falls back to 0.0.0.0 if undetected)
+ *   "auto"     → 0.0.0.0 when a routing domain is set/detected, else 127.0.0.1
+ *   "<addr>"   → used verbatim
+ */
+function resolveBindHost(
+  mode: string,
+  tailscaleIp: string | null,
+  hasDomain: boolean
+): string {
+  switch (mode) {
+    case "loopback":
+      return "127.0.0.1";
+    case "all":
+      return "0.0.0.0";
+    case "tailscale":
+      if (tailscaleIp) return tailscaleIp;
+      console.log(
+        "[config] bindHost=tailscale but no tailnet IP detected — falling back to 0.0.0.0"
+      );
+      return "0.0.0.0";
+    case "auto":
+      return hasDomain ? "0.0.0.0" : "127.0.0.1";
+    default:
+      return mode; // literal address
   }
 }
 
@@ -111,10 +170,10 @@ function extractSubdomain(host: string | null): string | null {
   if (hostname.endsWith(".localhost")) {
     return hostname.slice(0, -".localhost".length) || null;
   }
-  // *.{tailscaleHostname} (MagicDNS subdomain routing)
-  if (tailscaleHostname) {
-    if (hostname === tailscaleHostname) return null;
-    const suffix = `.${tailscaleHostname}`;
+  // *.{domain} (routing suffix, e.g. tailscale MagicDNS name or "home")
+  if (domain) {
+    if (hostname === domain) return null;
+    const suffix = `.${domain}`;
     if (hostname.endsWith(suffix)) {
       return hostname.slice(0, -suffix.length) || null;
     }
@@ -129,10 +188,10 @@ function isAllowedHost(host: string | null): boolean {
   if (hostname === "localhost" || hostname.endsWith(".localhost")) return true;
   if (hostname === "127.0.0.1" || hostname === "::1") return true;
   if (!hostname.includes(".")) return true; // bare hostnames from PAC
-  // MagicDNS: allow tailscale hostname and its subdomains
-  if (tailscaleHostname) {
-    if (hostname === tailscaleHostname) return true;
-    if (hostname.endsWith(`.${tailscaleHostname}`)) return true;
+  // Routing domain: allow the suffix itself and its subdomains
+  if (domain) {
+    if (hostname === domain) return true;
+    if (hostname.endsWith(`.${domain}`)) return true;
   }
   return false;
 }
@@ -176,20 +235,24 @@ function formatUptime(etime: string): string {
 
 /**
  * Build the link for a routable service name from the dashboard's request host:
- *   - reached via the Tailscale hostname → qualified `name.<tailscale>:<port>/`
- *     so it routes back to this machine over MagicDNS from a remote browser.
+ *   - reached via the routing domain → qualified `name.<domain>[:port]/` so it
+ *     routes back to this machine from a remote browser. The port is carried
+ *     over from how the dashboard itself was reached: if you opened it portlessly
+ *     (on :80, e.g. `http://home/`), the links stay portless too.
  *   - otherwise → bare `name/`, routed by the extension regardless of how the
  *     dashboard was reached (localhost, *.localhost, or a bare host like home/).
  */
 function serviceLinker(requestHost: string | null): (name: string) => string {
   const [hostname, portStr] = (requestHost || "").split(":");
-  const port = portStr || String(PORT);
+  // Mirror the dashboard's own port: an explicit non-80 port is preserved;
+  // no port (or :80) renders portless so the links match a port-80 deployment.
+  const portSuffix = portStr && portStr !== "80" ? `:${portStr}` : "";
   if (
-    tailscaleHostname &&
+    domain &&
     hostname &&
-    (hostname === tailscaleHostname || hostname.endsWith(`.${tailscaleHostname}`))
+    (hostname === domain || hostname.endsWith(`.${domain}`))
   ) {
-    return (name) => `http://${esc(name)}.${tailscaleHostname}:${port}/`;
+    return (name) => `http://${esc(name)}.${domain}${portSuffix}/`;
   }
   return (name) => `http://${esc(name)}/`;
 }
@@ -561,16 +624,20 @@ async function getOrCreateTlsListener(
 
 // ---- Main listener ----
 
-// Detect tailscale machine name for MagicDNS subdomain routing
-if (!tailscaleHostname) {
-  tailscaleHostname = await detectTailscale();
+// Detect tailscale identity once: fills in the routing domain when not set
+// explicitly, and provides the tailnet IP for bindHost="tailscale".
+const ts = await detectTailscale();
+if (!domain) {
+  domain = ts.name;
 }
 
+const bindHost = resolveBindHost(config.bindHost, ts.ip, domain !== null);
+
 // Load CA before starting (non-blocking — MITM just stays disabled if no CA)
-await loadCA();
+await loadCA(config.mkcertCaRoot);
 
 const listener = Bun.listen<SocketData>({
-  hostname: process.env.BIND_HOST || (tailscaleHostname ? "0.0.0.0" : "127.0.0.1"),
+  hostname: bindHost,
   port: PORT,
 
   socket: {
@@ -870,8 +937,9 @@ const actualPort = listener.port;
 console.log(`LISTENING:${actualPort}`);
 console.log(`localhome (tcp mode) listening on http://localhost:${actualPort}`);
 console.log(`Dashboard: http://localhost:${actualPort}`);
-if (tailscaleHostname) {
-  console.log(`Tailscale: http://${tailscaleHostname}:${actualPort} (MagicDNS)`);
-  console.log(`  Services at: http://<name>.${tailscaleHostname}:${actualPort}`);
+console.log(`Bound to: ${bindHost}:${actualPort}`);
+if (domain) {
+  console.log(`Routing domain: http://${domain}:${actualPort}`);
+  console.log(`  Services at: http://<name>.${domain}:${actualPort}`);
 }
 console.log(`\nStart services with: NAME=myapp bun run server.ts`);

@@ -1,0 +1,7 @@
+{
+  "port": 9090,
+  "bindHost": "auto",
+  "domain": null,
+  "probe": true,
+  "mkcertCaRoot": null
+}

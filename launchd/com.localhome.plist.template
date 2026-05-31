@@ -1,15 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template — do not edit the rendered copy by hand.
+  `just install` substitutes the @PLACEHOLDER@ tokens and writes
+  launchd/<label>.local.plist (gitignored), then loads it.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.slee2.localhome</string>
+    <string>@LABEL@</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/etc/profiles/per-user/slee2/bin/bun</string>
+        <string>@BUN@</string>
         <string>run</string>
-        <string>/Users/slee2/projects/localhome/src/index.ts</string>
+        <string>@REPO@/src/index.ts</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -19,19 +24,19 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/slee2/Library/Logs/localhome.log</string>
+    <string>@HOME@/Library/Logs/localhome.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/slee2/Library/Logs/localhome.error.log</string>
+    <string>@HOME@/Library/Logs/localhome.error.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
-        <string>/Users/slee2</string>
+        <string>@HOME@</string>
         <key>PATH</key>
-        <string>/etc/profiles/per-user/slee2/bin:/run/current-system/sw/bin:/usr/sbin:/usr/bin:/bin:/sbin</string>
+        <string>@PATH@</string>
         <key>NAME</key>
-        <string>home</string>
+        <string>@NAME@</string>
         <key>LANG</key>
         <string>en_US.UTF-8</string>
         <key>LC_ALL</key>

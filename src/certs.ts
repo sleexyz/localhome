@@ -14,7 +14,10 @@ let caKey: forge.pki.PrivateKey | null = null;
 const certCache = new Map<string, { cert: string; key: string }>();
 
 /** Find mkcert's CA root directory. */
-function findCaRoot(): string | null {
+function findCaRoot(override?: string | null): string | null {
+  // 0. Explicit config override
+  if (override) return override;
+
   // 1. Environment variable
   if (process.env.MKCERT_CA_ROOT) return process.env.MKCERT_CA_ROOT;
 
@@ -39,8 +42,8 @@ function findCaRoot(): string | null {
 }
 
 /** Load the mkcert CA certificate and key. Returns true if successful. */
-export async function loadCA(): Promise<boolean> {
-  const caRoot = findCaRoot();
+export async function loadCA(caRootOverride?: string | null): Promise<boolean> {
+  const caRoot = findCaRoot(caRootOverride);
   if (!caRoot) {
     console.log("[certs] No mkcert CA found — HTTPS MITM disabled");
     return false;
