@@ -1079,6 +1079,24 @@ describe("tailscale MagicDNS", () => {
     expect(body).not.toContain(`testapp.mybox:`);
   });
 
+  test("dashboard links are BARE when reached via the extension (forward proxy)", async () => {
+    // The extension proxies the dashboard as an absolute-URI request to the
+    // daemon's own name (_testhome). That signals the extension is driving the
+    // session, so links must be bare `testapp/` — NOT domain-qualified — even
+    // though the routing domain (mybox) is configured.
+    const resp = await retryRequest(
+      () =>
+        tcpRequest(
+          daemonPort,
+          `GET http://_testhome/ HTTP/1.1\r\nHost: _testhome\r\n\r\n`
+        ),
+      (r) => parseBody(r).includes("testapp")
+    );
+    const body = parseBody(resp);
+    expect(body).toContain(`href="http://testapp/"`);
+    expect(body).not.toContain("testapp.mybox");
+  });
+
   test("unknown tailscale subdomain returns 404", async () => {
     const resp = await tcpRequest(
       daemonPort,

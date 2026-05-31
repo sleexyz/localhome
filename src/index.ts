@@ -234,15 +234,25 @@ function formatUptime(etime: string): string {
 }
 
 /**
- * Build the link for a routable service name from the dashboard's request host:
- *   - reached via the routing domain → qualified `name.<domain>[:port]/` so it
- *     routes back to this machine from a remote browser. The port is carried
- *     over from how the dashboard itself was reached: if you opened it portlessly
- *     (on :80, e.g. `http://home/`), the links stay portless too.
- *   - otherwise → bare `name/`, routed by the extension regardless of how the
- *     dashboard was reached (localhost, *.localhost, or a bare host like home/).
+ * Build the link for a routable service name from the dashboard's request host.
+ *
+ * The choice is really "which routing mechanism works in THIS browser session":
+ *   - `viaExtension` (request arrived through the forward proxy / CONNECT) → the
+ *     Chrome extension is driving, so bare `name/` resolves and is prettiest.
+ *     The extension only ever proxies to this machine's own loopback, so a
+ *     forward-proxy request always means local-with-extension.
+ *   - else reached via the routing domain → qualified `name.<domain>[:port]/` so
+ *     it resolves from a remote browser over DNS. The port is carried over from
+ *     how the dashboard was reached (portless on :80 stays portless).
+ *   - else → bare `name/` (best-effort; assumes the extension or *.localhost).
  */
-function serviceLinker(requestHost: string | null): (name: string) => string {
+function serviceLinker(
+  requestHost: string | null,
+  viaExtension: boolean
+): (name: string) => string {
+  // Extension present → bare names route, no matter how the dashboard was reached.
+  if (viaExtension) return (name) => `http://${esc(name)}/`;
+
   const [hostname, portStr] = (requestHost || "").split(":");
   // Mirror the dashboard's own port: an explicit non-80 port is preserved;
   // no port (or :80) renders portless so the links match a port-80 deployment.
@@ -293,15 +303,19 @@ function renderUnregRow(
     </div>\n`;
 }
 
-// Dashboard HTML generator. Service links adapt to the request host: bare
-// `name/` locally (extension-routed), tailscale-qualified for remote access.
-async function renderDashboardHtml(requestHost: string | null): Promise<string> {
+// Dashboard HTML generator. Service links adapt to how the dashboard was
+// reached: bare `name/` when the extension is driving (forward proxy / CONNECT),
+// domain-qualified `name.<domain>/` when reached over DNS for remote access.
+async function renderDashboardHtml(
+  requestHost: string | null,
+  viaExtension: boolean
+): Promise<string> {
   const [servers, unregistered] = await Promise.all([
     scanServers(),
     getUnregistered(),
   ]);
   const home = process.env.HOME || "";
-  const link = serviceLinker(requestHost);
+  const link = serviceLinker(requestHost, viaExtension);
 
   let html = `<!DOCTYPE html>
 <html>
@@ -453,8 +467,10 @@ async function getOrCreateTlsListener(
             },
           });
         }
-        // Dashboard
-        const dashHtml = await renderDashboardHtml(req.headers.get("host"));
+        // Dashboard. This TLS listener is only ever reached via the extension's
+        // CONNECT MITM (HTTPS never hits localhome any other way), so the
+        // extension is definitionally present → bare links.
+        const dashHtml = await renderDashboardHtml(req.headers.get("host"), true);
         return new Response(dashHtml, {
           headers: { "content-type": "text/html; charset=utf-8" },
         });
@@ -828,7 +844,10 @@ const listener = Bun.listen<SocketData>({
             socket.end();
             return;
           }
-          const dashHtml = await renderDashboardHtml(socketData.host);
+          // `proxyTarget` is set only for absolute-URI forward-proxy requests,
+          // which the extension produces — so its presence means the extension
+          // is driving this session and bare `name/` links will route.
+          const dashHtml = await renderDashboardHtml(socketData.host, proxyTarget != null);
           socket.write(`HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n${dashHtml}`);
           socket.end();
           return;
